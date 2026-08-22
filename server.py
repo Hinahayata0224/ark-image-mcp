@@ -8,6 +8,8 @@ import time
 import uuid
 from typing import Optional
 
+from pydantic import BaseModel, Field
+
 import requests
 from mcp.server.fastmcp import FastMCP
 
@@ -90,12 +92,39 @@ def is_valid_size(size: str) -> bool:
 
 def _err(error_type: str, message: str) -> dict:
     """Unified error payload: {"ok": false, "error_type": ..., "error": ...}."""
-    return {"ok": False, "error_type": error_type, "error": message}
+    return {"ok": False, "error_type": error_type, "error": message,
+            "files": None, "urls": None, "usage": None, "notes": None,
+            "model": None, "created": None, "refined_prompt": None, "errors": None,
+            "profile": None, "images": None}
 
 
 def _ok(**fields) -> dict:
-    """Unified success payload: {"ok": true, **fields}."""
+    """Unified success payload: {"ok": True, **fields}."""
     return {"ok": True, **fields}
+
+
+class ImageResult(BaseModel):
+    """Unified structured output for image generation/editing tools."""
+    ok: bool
+    error_type: Optional[str] = None
+    error: Optional[str] = None
+    model: Optional[str] = None
+    created: Optional[int] = None
+    files: Optional[list] = None
+    urls: Optional[list] = None
+    usage: Optional[dict] = None
+    notes: Optional[list] = None
+    refined_prompt: Optional[str] = None
+    errors: Optional[list] = None
+
+
+class SceneProfileResult(BaseModel):
+    """Structured output for ark_scene_profile."""
+    ok: bool
+    error_type: Optional[str] = None
+    error: Optional[str] = None
+    profile: Optional[str] = None
+    images: Optional[int] = None
 
 
 def _unique_path(output_dir: str, ext: str) -> str:
@@ -187,27 +216,31 @@ def to_base64_data_uri(img_data: bytes) -> str:
 
 
 def maybe_compress(img_data: bytes) -> tuple:
-    """Normalize EXIF orientation, then resize to 1/2 if dimensions >= MAX_INPUT_DIM.
+    """Normalize EXIF orientation (only if rotated), then resize to 1/2 if dimensions >= MAX_INPUT_DIM.
 
     Returns (img_data, compressed) where compressed indicates whether a resize happened.
+    When orientation correction or resize is needed, the result is re-encoded as JPEG
+    (uniform, avoids quality drift from format-agnostic re-saves); otherwise the original
+    bytes are returned untouched.
     """
     if not HAS_PIL:
         return img_data, False
     try:
         img = PILImage.open(io.BytesIO(img_data))
-        img = ImageOps.exif_transpose(img)  # honor EXIF orientation (e.g. phone photos)
+        orientation = img.getexif().get(0x0112, 1)
+        need_transpose = orientation != 1
+        if need_transpose:
+            img = ImageOps.exif_transpose(img)
         w, h = img.size
-        if w < MAX_INPUT_DIM and h < MAX_INPUT_DIM:
-            buf = io.BytesIO()
-            img.save(buf, format=img.format or "JPEG")
-            return buf.getvalue(), False
-        new_w = w // 2
-        new_h = h // 2
-        img = img.resize((new_w, new_h), PILImage.LANCZOS)
+        if not need_transpose and w < MAX_INPUT_DIM and h < MAX_INPUT_DIM:
+            return img_data, False  # untouched
+        if w >= MAX_INPUT_DIM or h >= MAX_INPUT_DIM:
+            w, h = w // 2, h // 2
+            img = img.resize((w, h), PILImage.LANCZOS)
+            need_transpose = True  # mark as modified
         buf = io.BytesIO()
-        fmt = img.format or "PNG"
-        img.save(buf, format=fmt)
-        return buf.getvalue(), True
+        img.save(buf, format="JPEG", quality=92)
+        return buf.getvalue(), need_transpose
     except Exception:
         return img_data, False
 
@@ -285,7 +318,7 @@ def _chat_with_images(user_text: str, image_uris: list, max_tokens: int = 2000) 
 
 
 @mcp.tool()
-def ark_scene_profile(images: str, focus: Optional[str] = None) -> dict:
+def ark_scene_profile(images: str, focus: Optional[str] = None) -> SceneProfileResult:
     """Build a structured scene profile from multiple photos of the same scene/person.
 
     The multimodal model analyzes the photos together and produces a consolidated
@@ -415,7 +448,7 @@ def ark_generate_image(
     size: str = "2K",
     watermark: bool = False,
     response_format: str = "url"
-) -> dict:
+) -> ImageResult:
     """Generate images using Doubao-Seedream image generation model on 火山方舟.
 
     Args:
@@ -458,7 +491,7 @@ def ark_generate_image(
                 short_label = label[:60] + "..." if len(label) > 60 else label
                 compressed, was_compressed = maybe_compress(data)
                 if was_compressed:
-                    notes.append(f"Input compressed (dim >= {MAX_INPUT_DIM}px -> 1/2): {short_label}")
+                    notes.append(f"Input modified (orientation fixed or dim >= {MAX_INPUT_DIM}px resized): {short_label}")
                 processed.append(to_base64_data_uri(compressed))
             except Exception as e:
                 notes.append(f"Failed to load input: {src} - {e}")
@@ -495,6 +528,7 @@ def _generate_images(payload: dict, output_dir: str, notes: Optional[list] = Non
         return _ok(files=[], usage=result.get("usage"), notes=notes or None, raw=result)
 
     local_paths = []
+    urls = []
     errors = []
     for i, item in enumerate(data_list):
         url = item.get("url", "")
@@ -504,7 +538,7 @@ def _generate_images(payload: dict, output_dir: str, notes: Optional[list] = Non
                 local_paths.append(path)
             except Exception as e:
                 errors.append(f"Image {i} download failed: {e}")
-                local_paths.append(url)
+                urls.append(url)  # keep the URL so the image is still reachable
             continue
         b64 = item.get("b64_json", "")
         if b64:
@@ -513,6 +547,7 @@ def _generate_images(payload: dict, output_dir: str, notes: Optional[list] = Non
                 local_paths.append(path)
             except Exception as e:
                 errors.append(f"Image {i} base64 decode failed: {e}")
+                urls.append(f"data:{b64[:80]}...")  # base64 not recoverable to a file; keep a hint
             continue
         errors.append(f"Image {i} has neither url nor b64_json")
 
@@ -520,6 +555,7 @@ def _generate_images(payload: dict, output_dir: str, notes: Optional[list] = Non
         "model": result.get("model"),
         "created": result.get("created"),
         "files": local_paths,
+        "urls": urls if urls else None,
         "usage": result.get("usage"),
         "notes": notes if notes else None,
     }
@@ -537,7 +573,7 @@ def ark_edit_image(
     size: str = "2K",
     watermark: bool = False,
     scene_profile: Optional[str] = None,
-) -> dict:
+) -> ImageResult:
     """Edit a reference image via a two-step pipeline: the multimodal model (ARK_VISION_MODEL)
     rewrites your edit intent into a detailed, faithful English prompt based on the reference
     image, then Doubao-Seedream generates the edited image.
@@ -571,7 +607,7 @@ def ark_edit_image(
         short_label = label[:60] + "..." if len(label) > 60 else label
         compressed, was_compressed = maybe_compress(data)
         if was_compressed:
-            notes.append(f"Input compressed (dim >= {MAX_INPUT_DIM}px -> 1/2): {short_label}")
+            notes.append(f"Input modified (orientation fixed or dim >= {MAX_INPUT_DIM}px resized): {short_label}")
         processed = to_base64_data_uri(compressed)
     except Exception as e:
         return _err("load", f"failed to load reference image {image}: {e}")
@@ -604,7 +640,7 @@ def ark_revise_image(
     size: str = "2K",
     watermark: bool = False,
     scene_profile: Optional[str] = None,
-) -> dict:
+) -> ImageResult:
     """Revise a previously edited image based on user feedback.
 
     The multimodal model rewrites a revision prompt from the feedback: it regenerates the image
@@ -640,7 +676,7 @@ def ark_revise_image(
         short_label = label[:60] + "..." if len(label) > 60 else label
         compressed, was_compressed = maybe_compress(data)
         if was_compressed:
-            notes.append(f"Result compressed (dim >= {MAX_INPUT_DIM}px -> 1/2): {short_label}")
+            notes.append(f"Result modified (orientation fixed or dim >= {MAX_INPUT_DIM}px resized): {short_label}")
         processed = to_base64_data_uri(compressed)
     except Exception as e:
         return _err("load", f"failed to load result image {image}: {e}")

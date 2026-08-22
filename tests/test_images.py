@@ -41,10 +41,19 @@ def test_large_image_downscaled():
 def test_exif_orientation_applied():
     # raw pixels are landscape, EXIF says rotate 90 CW -> visual should be portrait
     data = _make_img_bytes((3000, 2000), exif_orient=8)
-    out, _ = server.maybe_compress(data)
+    out, compressed = server.maybe_compress(data)
+    assert compressed is True  # orientation fix counts as a modification
     img = Image.open(io.BytesIO(out))
     # exif_transpose(8) swaps dimensions; no resize because both dims < 5000
     assert img.size == (2000, 3000)
+
+
+def test_small_no_rotation_returns_original_bytes():
+    # no rotation + small -> original bytes untouched (no re-encode)
+    data = _make_img_bytes((800, 600))
+    out, compressed = server.maybe_compress(data)
+    assert compressed is False
+    assert out == data
 
 
 def test_data_uri_mime_jpeg():

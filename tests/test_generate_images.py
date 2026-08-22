@@ -100,6 +100,25 @@ def test_generate_images_empty_data(monkeypatch):
     assert out["files"] == []
 
 
+def test_generate_images_download_failure_keeps_url(monkeypatch, tmp_path):
+    import requests
+
+    def fake_post(*a, **k):
+        return _FakeResp({"data": [{"url": "https://img/x.png"}]})
+
+    def fake_get(url, *a, **k):
+        raise requests.exceptions.ConnectionError("dns fail")
+
+    monkeypatch.setattr(server.requests, "post", fake_post)
+    monkeypatch.setattr(server.requests, "get", fake_get)
+    monkeypatch.setattr(server.time, "sleep", lambda s: None)
+    out = server._generate_images({"model": "m", "prompt": "x"}, str(tmp_path))
+    assert out["ok"] is True
+    assert out["files"] == []          # nothing saved locally
+    assert out["urls"] == ["https://img/x.png"]  # URL preserved so image is reachable
+    assert out["errors"]
+
+
 def test_generate_images_retries_on_5xx(monkeypatch, tmp_path):
     png = _png_bytes()
     calls = {"n": 0}
