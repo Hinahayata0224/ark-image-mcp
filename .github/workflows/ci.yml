@@ -1,0 +1,56 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        python-version: ["3.10", "3.11", "3.12"]
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v5
+
+      - name: Set up Python ${{ matrix.python-version }}
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+
+      - name: Install dependencies
+        run: uv sync --extra dev
+
+      - name: Compile check
+        run: uv run python -m py_compile server.py
+
+      - name: Run tests (offline, no API calls)
+        run: uv run pytest -v
+
+      - name: MCP stdio smoke test
+        env:
+          ARK_API_KEY: "test-placeholder-key"
+        run: |
+          uv run python - <<'PY'
+          import json, subprocess, os
+          env = dict(os.environ)
+          proc = subprocess.Popen(
+              [os.sys.executable, "server.py"],
+              stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+              env=env, text=True, bufsize=1)
+          def send(obj):
+              proc.stdin.write(json.dumps(obj) + "\n"); proc.stdin.flush()
+              return json.loads(proc.stdout.readline())
+          send({"jsonrpc":"2.0","id":1,"method":"initialize","params":{
+              "protocolVersion":"2024-11-05","capabilities":{},
+              "clientInfo":{"name":"ci","version":"0.1"}}})
+          tools = send({"jsonrpc":"2.0","id":2,"method":"tools/list","params":{}})
+          names = [t["name"] for t in tools["result"]["tools"]]
+          assert "ark_edit_image" in names and "ark_scene_profile" in names, names
+          print("smoke ok:", names)
+          proc.terminate()
+          PY

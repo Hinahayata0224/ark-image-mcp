@@ -1,0 +1,32 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+.ruff_cache/
+
+# Virtual environment
+.venv/
+venv/
+env/
+
+# Generated images (outputs of the MCP server)
+ark_img_*.jpg
+ark_img_*.png
+ark_img_*.webp
+output/
+
+# Secrets — NEVER commit API keys
+.env
+.env.*
+config.json
+*.key
+*secret*
+*credentials*
+
+# OS / editor
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
+*.swp
