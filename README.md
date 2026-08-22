@@ -7,6 +7,13 @@ A single-file [MCP](https://modelcontextprotocol.io) server that lets any MCP cl
 Seedream image models — with a vision model used to read reference images and write
 faithful, detailed prompts.
 
+> **Design intent** — *give a smart blind model multimodal superpowers.*
+> Most coding agents are text-only: they cannot see the images in your workspace, so
+> they cannot edit them. This server acts as their eyes and hands — the vision model
+> describes what is in a photo, the editing model redraws it, and the agent only ever
+> deals with text (a path, an intent, a returned JSON). That way a model with zero
+> vision capability can still "look at" and modify images as if it could see them.
+
 ## Features
 
 - **Text-to-image** and **image-to-image** generation (`ark_generate_image`).
@@ -65,6 +72,56 @@ Environment variables:
 
 > The server also exposes a full usage manual through MCP `instructions` (returned on
 > `initialize`) — clients/models that read it can use the tools without extra docs.
+
+## Client setup (works in ZCode, OpenCode, Codex)
+
+Because this is a standard stdio MCP server, it plugs into any MCP-compatible client.
+Below are the three common setups (adjust paths to your install).
+
+**ZCode** — add to the `mcp.servers` block of your ZCode config:
+
+```json
+{
+  "mcp": {
+    "servers": {
+      "ark-image-gen": {
+        "type": "stdio",
+        "command": "C:\\path\\to\\ark-image-mcp\\.venv\\Scripts\\python.exe",
+        "args": ["C:\\path\\to\\ark-image-mcp\\server.py"],
+        "env": { "ARK_API_KEY": "ark-..." }
+      }
+    }
+  }
+}
+```
+
+**OpenCode** — in `opencode.json` (project or global):
+
+```json
+{
+  "mcp": {
+    "ark-image-gen": {
+      "type": "local",
+      "command": ["/path/to/ark-image-mcp/.venv/bin/python", "/path/to/ark-image-mcp/server.py"],
+      "environment": { "ARK_API_KEY": "ark-..." },
+      "enabled": true
+    }
+  }
+}
+```
+
+**Codex** — in `~/.codex/config.toml`:
+
+```toml
+[mcp.servers.ark-image-gen]
+command = "/path/to/ark-image-mcp/.venv/bin/python"
+args = ["/path/to/ark-image-mcp/server.py"]
+env = { ARK_API_KEY = "ark-..." }
+```
+
+> The tools are then available to the agent as normal MCP tools
+> (`ark_generate_image`, `ark_edit_image`, `ark_revise_image`, `ark_scene_profile`).
+> Even a model with no vision capability can "see" and edit images through these tools.
 
 ## Tools
 
