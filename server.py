@@ -66,7 +66,7 @@ ARK_VISION_MODEL = os.environ.get("ARK_VISION_MODEL", "doubao-seed-2-1-pro-26062
 ARK_TIMEOUT = int(os.environ.get("ARK_TIMEOUT", "300"))
 
 try:
-    from PIL import Image as PILImage, ImageOps
+    from PIL import Image as PILImage, ImageDraw, ImageOps
     HAS_PIL = True
 except ImportError:
     HAS_PIL = False
@@ -270,7 +270,8 @@ def _post_with_retry(url: str, headers: dict, json_body: dict, timeout: int) -> 
     return resp
 
 
-def _chat_with_image(user_text: str, image_data_uri: str, max_tokens: int = 1500) -> str:
+def _chat_with_image(user_text: str, image_data_uri: str, max_tokens: int = 1500,
+                     timeout: int = 180) -> str:
     """Call the multimodal chat model (ARK_VISION_MODEL) with a text + image message."""
     headers = {"Content-Type": "application/json", "Authorization": f"Bearer {ARK_API_KEY}"}
     body = {
@@ -285,7 +286,8 @@ def _chat_with_image(user_text: str, image_data_uri: str, max_tokens: int = 1500
         "max_tokens": max_tokens,
         "temperature": 0.3,
     }
-    resp = requests.post(f"{ARK_API_BASE}/chat/completions", headers=headers, json=body, timeout=180)
+    resp = requests.post(f"{ARK_API_BASE}/chat/completions", headers=headers, json=body,
+                         timeout=(30, timeout))
     resp.raise_for_status()
     return resp.json()["choices"][0]["message"]["content"]
 
@@ -402,6 +404,37 @@ def refine_edit_prompt(img_data: bytes, intent: str, scene_profile: Optional[str
     return _chat_with_image(instruction, uri)
 
 
+def refine_edit_prompt_with_context(img_data: bytes, intent: str,
+                                    scene_profile: Optional[str],
+                                    context_uris: list) -> str:
+    """Like refine_edit_prompt, but also shows additional same-scene photos as
+    visual memory to improve scene/outfit consistency."""
+    uri = to_base64_data_uri(img_data)
+    instruction = (
+        "You are a professional image-editing prompt engineer. The FIRST image is the reference "
+        "image to edit; the images after it are ADDITIONAL photos of the SAME scene/person used "
+        "as visual memory (they may show details not visible in the reference). Rewrite the user's "
+        "edit intent into ONE detailed English prompt for image-to-image editing, faithful to the "
+        "reference and consistent with the additional photos. Requirements:\n"
+        "1) Begin by stating this is an edit of the provided reference photograph, preserving all "
+        "original subjects, scene composition, lighting, and framing.\n"
+        "2) Describe the single requested modification with accurate, professional, tasteful wording.\n"
+        "3) Explicitly state that clothing structure, color, fabric texture and fold direction must "
+        "remain unchanged around the modified area.\n"
+        "4) Use details from the additional photos (outfit, accessories, background, pose) to make "
+        "the reproduction faithful, but do NOT alter the reference image's own content.\n"
+        "5) Output ONLY the prompt text - no explanations, no prefixes, no quotation marks.\n\n"
+        f"[Edit intent] {intent}"
+    )
+    if scene_profile:
+        instruction += (
+            "\n\nA scene profile of this same scene/person is provided below. Use it to keep the "
+            "scene and outfit consistent with the established profile.\n"
+            f"[Scene profile] {scene_profile}"
+        )
+    return _chat_with_images(instruction, [uri] + context_uris)
+
+
 def revise_edit_prompt(result_data: bytes, revision: str,
                        reference_data: Optional[bytes] = None,
                        scene_profile: Optional[str] = None) -> str:
@@ -439,6 +472,137 @@ def revise_edit_prompt(result_data: bytes, revision: str,
             f"[Scene profile] {scene_profile}"
         )
     return _chat_with_images(instruction, images)
+
+
+# ---------- 感知层：可查询的视觉接口 ----------
+
+def _parse_bbox(text: str) -> Optional[list]:
+    """Parse a [x1,y1,x2,y2] bbox from model output (0-1000 normalized)."""
+    if not text:
+        return None
+    # try strict JSON array first (handle quotes/whitespace)
+    try:
+        arr = json.loads(text.strip())
+        if isinstance(arr, list) and len(arr) == 4 and all(isinstance(v, (int, float)) for v in arr):
+            return [int(v) for v in arr]
+    except (json.JSONDecodeError, ValueError):
+        pass
+    m = re.search(r"\[\s*(-?\d+)\s*,\s*(-?\d+)\s*,\s*(-?\d+)\s*,\s*(-?\d+)\s*\]", text)
+    if not m:
+        return None
+    return [int(m.group(i)) for i in range(1, 5)]
+
+
+@mcp.tool()
+def ark_analyze_image(
+    image: str,
+    query: str,
+    region: Optional[str] = None,
+) -> SceneProfileResult:
+    """Ask a targeted question about a region of an image (the vision model 'sees' it).
+
+    Unlike a one-shot description, this gives the caller a queryable, region-scoped
+    'eye': you can ask about the whole image or a specific region and get a focused
+    answer back.
+
+    Args:
+        image: Local path or URL of the image
+        query: Your question, e.g. "what color is the girl's top?" or
+               "describe the pattern on the cup"
+        region: Optional region to focus on, as [x1,y1,x2,y2] in 0-1000 normalized
+                coordinates (top-left origin), e.g. "[200,100,600,500]"
+    """
+    if not ARK_API_KEY:
+        return _err("config", "ARK_API_KEY environment variable is not set.")
+    if not image or not image.strip():
+        return _err("invalid_argument", "image is required.")
+    if not query or not query.strip():
+        return _err("invalid_argument", "query must not be empty.")
+    try:
+        data, _ = load_input_image(image)
+        uri = _downscale_uri(data)
+    except Exception as e:
+        return _err("load", f"failed to load image {image}: {e}")
+
+    text = query.strip()
+    if region:
+        text = f"Focus ONLY on the region {region} (0-1000 normalized, top-left origin).\n{text}"
+    try:
+        answer = _chat_with_image(text, uri, max_tokens=800)
+    except Exception as e:
+        return _err("api", f"analyze chat failed: {e}")
+    return _ok(profile=answer, images=1)
+
+
+@mcp.tool()
+def ark_locate_object(
+    image: str,
+    object_desc: str,
+) -> dict:
+    """Locate an object in an image, returning its bounding box.
+
+    Gives the caller spatial coordinates so edits can target a region precisely.
+
+    Args:
+        image: Local path or URL of the image
+        object_desc: What to find, e.g. "the girl's head" or "the coffee cup"
+    """
+    if not ARK_API_KEY:
+        return _err("config", "ARK_API_KEY environment variable is not set.")
+    if not image or not image.strip():
+        return _err("invalid_argument", "image is required.")
+    if not object_desc or not object_desc.strip():
+        return _err("invalid_argument", "object_desc must not be empty.")
+    try:
+        data, _ = load_input_image(image)
+        uri = _downscale_uri(data)
+    except Exception as e:
+        return _err("load", f"failed to load image {image}: {e}")
+
+    instruction = (
+        f"Locate '{object_desc.strip()}' in the image. Reply with ONLY a JSON array "
+        "[x1, y1, x2, y2] (0-1000 normalized, top-left origin, x1<x2, y1<y2). "
+        "If not present, reply with null."
+    )
+    raw = None
+    try:
+        raw = _chat_with_image(instruction, uri, max_tokens=100, timeout=300)
+    except Exception as e:
+        try:  # one retry — vision service occasionally times out
+            raw = _chat_with_image(instruction, uri, max_tokens=100, timeout=300)
+        except Exception as e2:
+            return _err("api", f"locate chat failed: {e2}")
+    bbox = _parse_bbox(raw)
+    if bbox is None:
+        return _ok(found=False, bbox=None, raw=(raw or "").strip()[:100])
+    return _ok(found=True, bbox=bbox, raw=None)
+
+
+# ---------- 空间操作层：region/mask 编辑 ----------
+
+def _region_to_mask(img_size: tuple, region: str) -> Optional[bytes]:
+    """Convert a '[x1,y1,x2,y2]' (0-1000) region into a white-on-black mask PNG bytes
+    (white = edit area, black = preserve). Returns None if the region is invalid."""
+    bbox = _parse_bbox(region)
+    if not bbox:
+        return None
+    w, h = img_size
+    x1, y1, x2, y2 = bbox
+    # clamp to image
+    px1 = max(0, int(x1 / 1000 * w)); py1 = max(0, int(y1 / 1000 * h))
+    px2 = min(w, int(x2 / 1000 * w)); py2 = min(h, int(y2 / 1000 * h))
+    if px2 <= px1 or py2 <= py1:
+        return None
+    mask = PILImage.new("L", (w, h), 0)
+    d = ImageDraw.Draw(mask)
+    d.rectangle([px1, py1, px2, py2], fill=255)
+    buf = io.BytesIO()
+    mask.save(buf, format="PNG")
+    return buf.getvalue()
+
+
+def _mask_to_uri(mask_bytes: bytes) -> str:
+    return f"data:image/png;base64,{base64.b64encode(mask_bytes).decode()}"
 
 
 @mcp.tool()
@@ -573,6 +737,9 @@ def ark_edit_image(
     size: str = "2K",
     watermark: bool = False,
     scene_profile: Optional[str] = None,
+    region: Optional[str] = None,
+    mask: Optional[str] = None,
+    context_images: Optional[str] = None,
 ) -> ImageResult:
     """Edit a reference image via a two-step pipeline: the multimodal model (ARK_VISION_MODEL)
     rewrites your edit intent into a detailed, faithful English prompt based on the reference
@@ -586,6 +753,12 @@ def ark_edit_image(
         watermark: Whether to add watermark
         scene_profile: Optional scene profile text from ark_scene_profile for the same
                 scene/person; injected into prompt refinement to keep consistency
+        region: Optional '[x1,y1,x2,y2]' (0-1000 normalized) to restrict the edit to that
+                region via a mask; everything outside is preserved (white = edit area)
+        mask: Optional path/URL to a mask image (white = edit area, black = preserve);
+                overrides `region`
+        context_images: Optional comma-separated additional same-scene photos, used as
+                visual memory for the prompt refinement (consistency across the scene)
     """
     if not ARK_API_KEY:
         return _err("config", "ARK_API_KEY environment variable is not set.")
@@ -609,13 +782,47 @@ def ark_edit_image(
         if was_compressed:
             notes.append(f"Input modified (orientation fixed or dim >= {MAX_INPUT_DIM}px resized): {short_label}")
         processed = to_base64_data_uri(compressed)
+        pil_img = PILImage.open(io.BytesIO(compressed))
+        img_size = pil_img.size
     except Exception as e:
         return _err("load", f"failed to load reference image {image}: {e}")
+
+    # 空间操作：region 或 mask -> seedream mask 参数
+    payload_mask = None
+    if mask and mask.strip():
+        try:
+            mask_data, _ = load_input_image(mask)
+            payload_mask = _mask_to_uri(mask_data)
+            notes.append(f"Using mask from: {mask}")
+        except Exception as e:
+            return _err("load", f"failed to load mask image {mask}: {e}")
+    elif region and region.strip():
+        mask_bytes = _region_to_mask(img_size, region)
+        if mask_bytes is None:
+            return _err("invalid_argument",
+                        f"invalid region '{region}'. Expected [x1,y1,x2,y2] (0-1000).")
+        payload_mask = _mask_to_uri(mask_bytes)
+        notes.append(f"Using region mask: {region}")
+
+    # 视觉记忆：context_images 并入 prompt 重构
+    context_uris = None
+    if context_images and context_images.strip():
+        context_uris = []
+        for src in context_images.split(","):
+            try:
+                cdata, _ = load_input_image(src)
+                context_uris.append(_downscale_uri(cdata))
+            except Exception as e:
+                notes.append(f"Context image failed to load, skipped: {src} - {e}")
 
     refined_prompt = None
     try:
         logger.info("Refining edit prompt with vision model %s", ARK_VISION_MODEL)
-        refined_prompt = refine_edit_prompt(compressed, intent, scene_profile)
+        if context_uris:
+            refined_prompt = refine_edit_prompt_with_context(
+                compressed, intent, scene_profile, context_uris)
+        else:
+            refined_prompt = refine_edit_prompt(compressed, intent, scene_profile)
     except Exception as e:
         notes.append(f"Prompt refinement failed, using raw intent instead: {e}")
 
@@ -627,8 +834,10 @@ def ark_edit_image(
         "size": size,
         "watermark": watermark,
     }
+    if payload_mask:
+        payload["mask"] = payload_mask
     extra = {"refined_prompt": refined_prompt} if refined_prompt else None
-    logger.info("Generating edited image: size=%s model=%s", size, ARK_MODEL)
+    logger.info("Generating edited image: size=%s mask=%s model=%s", size, bool(payload_mask), ARK_MODEL)
     return _generate_images(payload, output_dir, notes, extra)
 
 
@@ -708,6 +917,75 @@ def ark_revise_image(
     extra = {"refined_prompt": refined_prompt} if refined_prompt else None
     logger.info("Generating revised image: size=%s model=%s", size, ARK_MODEL)
     return _generate_images(payload, output_dir, notes, extra)
+
+
+def _parse_json_obj(text: str) -> Optional[dict]:
+    """Best-effort JSON object parse from model output."""
+    cleaned = text.strip()
+    if cleaned.startswith("```"):
+        cleaned = re.sub(r"^```(?:json)?\s*", "", cleaned)
+        cleaned = re.sub(r"\s*```$", "", cleaned)
+    try:
+        return json.loads(cleaned)
+    except json.JSONDecodeError:
+        m = re.search(r"\{.*\}", cleaned, re.DOTALL)
+        if m:
+            try:
+                return json.loads(m.group(0))
+            except json.JSONDecodeError:
+                return None
+        return None
+
+
+@mcp.tool()
+def ark_verify_edit(
+    original: str,
+    edited: str,
+    intent: str,
+) -> dict:
+    """Verify an edited image against the original and the edit intent.
+
+    Closes the perception->generation loop: the vision model compares the two images
+    and reports whether the requested change was applied, whether anything unintended
+    changed, and whether there are artifacts. The caller can decide whether to retry.
+
+    Args:
+        original: Local path or URL of the original reference image
+        edited: Local path or URL of the edited result image
+        intent: The edit intent that was requested
+    """
+    if not ARK_API_KEY:
+        return _err("config", "ARK_API_KEY environment variable is not set.")
+    if not original or not edited or not intent:
+        return _err("invalid_argument", "original, edited and intent are required.")
+    try:
+        orig_data, _ = load_input_image(original)
+        edit_data, _ = load_input_image(edited)
+        orig_uri = _downscale_uri(orig_data)
+        edit_uri = _downscale_uri(edit_data)
+    except Exception as e:
+        return _err("load", f"failed to load images: {e}")
+
+    instruction = (
+        "You are an image-editing QA reviewer. The FIRST image is the original reference photo; "
+        "the SECOND is the edited result. The edit intent was:\n"
+        f"[Intent] {intent}\n\n"
+        "Evaluate: 1) Was the requested modification applied, at the right extent? "
+        "2) Did anything unintended change (clothing, other people, background, lighting, composition)? "
+        "3) Any visible artifacts or distortion?\n"
+        'Reply with JSON ONLY, exactly: {"passed": true/false, '
+        '"reasons": ["each failure reason in Chinese; empty list if passed"], '
+        '"summary": "one-sentence verdict in Chinese"}'
+    )
+    try:
+        raw = _chat_with_images(instruction, [orig_uri, edit_uri], max_tokens=600)
+    except Exception as e:
+        return _err("api", f"verify chat failed: {e}")
+    result = _parse_json_obj(raw)
+    if result is None or result.get("passed") is None:
+        return _ok(passed=None, reasons=[], summary=raw.strip()[:300], raw=raw)
+    return _ok(passed=result.get("passed"), reasons=result.get("reasons", []),
+               summary=result.get("summary", ""), raw=None)
 
 
 def main() -> None:

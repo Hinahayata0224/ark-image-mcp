@@ -128,9 +128,25 @@ env = { ARK_API_KEY = "ark-..." }
 | Tool | Purpose | Key args |
 |---|---|---|
 | `ark_scene_profile` | Build a scene profile from multiple same-scene photos | `images`, `focus` |
-| `ark_edit_image` | Edit a single reference image from an intent | `intent`, `image`, `size`, `scene_profile` |
+| `ark_analyze_image` | Ask a targeted question about an image (or a region) | `image`, `query`, `region` |
+| `ark_locate_object` | Locate an object, returning a bounding box | `image`, `object_desc` |
+| `ark_edit_image` | Edit a single reference image from an intent | `intent`, `image`, `size`, `scene_profile`, `region`, `mask`, `context_images` |
 | `ark_revise_image` | Iterate on a previous result from feedback | `revision`, `image`, `reference`, `size`, `scene_profile` |
+| `ark_verify_edit` | Verify an edit against the original + intent (QA loop) | `original`, `edited`, `intent` |
 | `ark_generate_image` | Direct text/image-to-image generation | `prompt`, `image`, `size`, `response_format` |
+
+### Spatial & memory features
+
+- **Region-scoped edits**: pass `region="[x1,y1,x2,y2]"` (0-1000 normalized) to
+  `ark_edit_image` to restrict the change to that area — a mask is generated
+  (white = edit area) and everything outside is preserved.
+- **Custom mask**: pass `mask=<path/url>` to `ark_edit_image` for a hand-drawn mask
+  (white = edit, black = preserve).
+- **Visual memory**: pass `context_images="a.jpg,b.jpg"` (same-scene photos) to
+  `ark_edit_image`; they are shown to the vision model during prompt refinement so
+  outfit/scene details stay consistent even when the reference is cropped or blurry.
+- **QA loop**: after an edit, `ark_verify_edit(original, edited, intent)` returns
+  `{passed, reasons, summary}` so the caller can decide whether to retry.
 
 ### Recommended workflow
 
