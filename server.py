@@ -919,6 +919,69 @@ def ark_revise_image(
     return _generate_images(payload, output_dir, notes, extra)
 
 
+def _capture_screen_region(region: Optional[str] = None) -> Optional[PILImage.Image]:
+    """Capture the screen (whole or a region) using PIL.ImageGrab.
+
+    region is '[x1,y1,x2,y2]' in 0-1000 normalized screen coords.
+    Returns a PIL Image, or None on platforms without ImageGrab.
+    """
+    try:
+        from PIL import ImageGrab
+    except ImportError:
+        return None
+    if not region:
+        return ImageGrab.grab()
+    bbox = _parse_bbox(region)
+    if not bbox:
+        return None
+    sw, sh = ImageGrab.grab().size
+    x1, y1, x2, y2 = bbox
+    px1 = max(0, int(x1 / 1000 * sw)); py1 = max(0, int(y1 / 1000 * sh))
+    px2 = min(sw, int(x2 / 1000 * sw)); py2 = min(sh, int(y2 / 1000 * sh))
+    if px2 <= px1 or py2 <= py1:
+        return None
+    return ImageGrab.grab(bbox=(px1, py1, px2, py2))
+
+
+@mcp.tool()
+def ark_capture_screen(
+    region: Optional[str] = None,
+    max_dim: int = 2048,
+) -> dict:
+    """Capture the current screen (or a region) and save it as a PNG.
+
+    Gives the agent the ability to visually inspect the current state of the
+    software it is working with — take a screenshot, then feed it to
+    ark_analyze_image / ark_locate_object / ark_verify_edit for visual QA.
+
+    Args:
+        region: Optional '[x1,y1,x2,y2]' (0-1000 normalized screen coords) to
+                capture only part of the screen (e.g. a specific window area)
+        max_dim: Downscale the captured image so its longest side is <= this
+                (default 2048), keeping screenshots manageable
+    """
+    if not ARK_API_KEY:
+        return _err("config", "ARK_API_KEY environment variable is not set.")
+    img = _capture_screen_region(region)
+    if img is None:
+        return _err("api", "screen capture not supported on this platform (needs PIL.ImageGrab, "
+                           "e.g. Windows/macOS).")
+    try:
+        if max_dim and max(img.size) > max_dim:
+            ratio = max_dim / max(img.size)
+            img = img.resize((int(img.size[0] * ratio), int(img.size[1] * ratio)), PILImage.LANCZOS)
+        output_dir = os.getcwd()
+        os.makedirs(output_dir, exist_ok=True)
+        ts = int(time.time())
+        token = uuid.uuid4().hex[:6]
+        filepath = os.path.join(output_dir, f"ark_screen_{ts}_{token}.png")
+        img.save(filepath, format="PNG")
+    except Exception as e:
+        return _err("load", f"failed to save screenshot: {e}")
+    logger.info("Screen captured: %s (%s)", filepath, img.size)
+    return _ok(file=filepath, size=list(img.size))
+
+
 def _parse_json_obj(text: str) -> Optional[dict]:
     """Best-effort JSON object parse from model output."""
     cleaned = text.strip()

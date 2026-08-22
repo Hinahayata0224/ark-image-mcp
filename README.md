@@ -132,6 +132,7 @@ env = { ARK_API_KEY = "ark-..." }
 | `ark_locate_object` | Locate an object, returning a bounding box | `image`, `object_desc` |
 | `ark_edit_image` | Edit a single reference image from an intent | `intent`, `image`, `size`, `scene_profile`, `region`, `mask`, `context_images` |
 | `ark_revise_image` | Iterate on a previous result from feedback | `revision`, `image`, `reference`, `size`, `scene_profile` |
+| `ark_capture_screen` | Capture the screen (or a region) as a PNG | `region`, `max_dim` |
 | `ark_verify_edit` | Verify an edit against the original + intent (QA loop) | `original`, `edited`, `intent` |
 | `ark_generate_image` | Direct text/image-to-image generation | `prompt`, `image`, `size`, `response_format` |
 
@@ -147,6 +148,26 @@ env = { ARK_API_KEY = "ark-..." }
   outfit/scene details stay consistent even when the reference is cropped or blurry.
 - **QA loop**: after an edit, `ark_verify_edit(original, edited, intent)` returns
   `{passed, reasons, summary}` so the caller can decide whether to retry.
+
+### Visual inspection loop (screen capture)
+
+`ark_capture_screen` lets the agent take a screenshot of the software it is
+working on and feed it back into the perception tools — a self-contained
+"look, judge, continue" loop:
+
+```
+work on the software
+  → ark_capture_screen(region?)          # capture current UI state
+  → ark_analyze_image(<screenshot>, "is this correct?")   # see it
+  → ark_locate_object(<screenshot>, "save button")        # find UI elements
+  → ark_verify_edit(<before>, <after>, intent)            # confirm a change
+  → continue the workflow
+```
+
+Screenshots are saved as `ark_screen_*.png` in the caller's working directory.
+`region="[x1,y1,x2,y2]"` (0-1000 normalized) captures only part of the screen.
+Requires a platform with `PIL.ImageGrab` (Windows/macOS); on others the tool
+returns a clear error.
 
 ### Recommended workflow
 
