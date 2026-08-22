@@ -30,3 +30,6 @@ Thumbs.db
 .idea/
 .vscode/
 *.swp
+
+# Screen captures
+ark_screen_*.png
