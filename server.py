@@ -305,7 +305,7 @@ def _downscale_uri(img_data: bytes, max_dim: int = 1024, quality: int = 85) -> s
 def _chat_with_images(user_text: str, image_uris: list, max_tokens: int = 2000,
                       timeout: int = 300) -> str:
     """Call the multimodal chat model (ARK_VISION_MODEL) with text and multiple images.
-    Retries once on 429 (vision service is rate-limited/flaky)."""
+    Retries once on 429/timeout (vision service is flaky)."""
     headers = {"Content-Type": "application/json", "Authorization": f"Bearer {ARK_API_KEY}"}
     body = {
         "model": ARK_VISION_MODEL,
@@ -1067,11 +1067,11 @@ def ark_verify_edit(
 
 
 IDENTITY_TEMPLATE_PRESETS = [
-    ("正脸头肩照", "正面直视镜头，头部肩部特写，标准证件照式正脸"),
-    ("四分之三侧头肩照", "四分之三侧面，微微侧头，头肩部特写"),
-    ("纯侧面轮廓照", "正侧面轮廓，头肩部特写"),
-    ("全身正面站立照", "全身正面站立，自然站姿，从头部到脚"),
-    ("微笑正脸头肩照", "正脸微笑，头肩部特写"),
+    ("正面半身像", "正面朝向镜头，构图裁到腰部（上半身完整入画），双臂自然垂放或自然摆放，左右手臂都不被切出画面"),
+    ("四十五度侧面半身像", "四十五度侧面朝向镜头，构图裁到腰部（上半身完整入画），双臂自然垂放或自然摆放，左右手臂都不被切出画面"),
+    ("正面微笑半身像", "正面朝向镜头自然微笑，构图裁到腰部（上半身完整入画），双臂自然垂放或自然摆放，左右手臂都不被切出画面"),
+    ("四十五度侧面微笑半身像", "四十五度侧面朝向镜头自然微笑，构图裁到腰部（上半身完整入画），双臂自然垂放或自然摆放，左右手臂都不被切出画面"),
+    ("正面全身像", "正面朝向镜头全身入画，自然站姿，双臂自然垂放，手臂完整不被切出画面"),
 ]
 
 
@@ -1188,15 +1188,35 @@ def ark_generate_identity_templates(
     prev_cwd = os.getcwd()
     os.chdir(output_dir)  # ark_edit_image saves to cwd; run inside the input folder
 
+    # 模板组合：默认生成 正面 + 四十五度侧面 各一张（上半身到腰部、双臂完整）
+    template_specs = [
+        ("正面半身像", IDENTITY_TEMPLATE_PRESETS[0][1]),
+        ("四十五度侧面半身像", IDENTITY_TEMPLATE_PRESETS[1][1]),
+    ]
+    if count > 2:
+        template_specs += [(d, p) for d, p in IDENTITY_TEMPLATE_PRESETS[2:2 + (count - 2)]]
+
+    # 身份画像存为 md，放在同目录，供后续生图参考
+    profile_md = f"# Identity Profile\n\n{profile}\n"
+    md_path = os.path.join(output_dir, "identity_profile.md")
+    try:
+        with open(md_path, "w", encoding="utf-8") as f:
+            f.write(profile_md)
+        logger.info("Identity profile saved to %s", md_path)
+    except Exception as e:
+        logger.warning("Failed to write identity profile md: %s", e)
+        md_path = None
+
     templates = []
     try:
-        for desc, pose in IDENTITY_TEMPLATE_PRESETS[:count]:
+        for desc, pose in template_specs:
             intent = (
                 f"生成一张{desc}：{pose}。\n"
                 "要求：整体呈自然生活照质感，不是证件照——背景为柔和的自然室内/户外中性环境"
                 "（如素雅的米白色墙面、虚化的自然光，无任何图案、文字、logo）；"
                 "穿着为简约的自然色系便装（如浅色基础款，无图案无logo，不要正式西装或制服）；"
                 "表情自然放松，光线柔和自然，符合日常真实照片的质感；"
+                "构图必须把人物完整上半身（到腰部）纳入画面，双臂完整可见、左右手臂都不被裁切；"
                 "面部必须是参考人物的真实身份（严格按身份画像的五官特征）；"
                 "忽略参考图中原有的服装、背景、光线、色调，只保留人物的面部与体态身份特征。"
             )
@@ -1217,7 +1237,8 @@ def ark_generate_identity_templates(
     finally:
         os.chdir(prev_cwd)
 
-    return _ok(identity_profile=profile, anchor=os.path.basename(anchor_path),
+    return _ok(identity_profile=profile, identity_profile_md=md_path,
+               anchor=os.path.basename(anchor_path),
                output_dir=output_dir, templates=templates, total=len(templates))
 
 

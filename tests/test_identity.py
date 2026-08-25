@@ -36,3 +36,10 @@ def test_vision_images_sampling():
     assert len(set(sampled)) == 5
     # no sampling when under limit
     assert server._sample_images(list(range(3)), 5) == [0, 1, 2]
+
+
+def test_template_presets_waist_and_arms():
+    # presets must include waist-framing and full-arms requirement
+    assert "腰部" in server.IDENTITY_TEMPLATE_PRESETS[0][1]
+    assert "手臂" in server.IDENTITY_TEMPLATE_PRESETS[0][1]
+    assert "四十五度" in server.IDENTITY_TEMPLATE_PRESETS[1][0]
