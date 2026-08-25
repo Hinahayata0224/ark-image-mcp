@@ -1130,66 +1130,95 @@ def ark_generate_identity_templates(
     if problems:
         logger.warning("ark_generate_identity_templates: some images failed: %s", problems)
 
-    # Vision model is flaky with many images — sample evenly to keep angle variety.
-    loaded_vision = _sample_images(loaded, MAX_VISION_IMAGES)
-    if len(loaded_vision) < len(loaded):
-        logger.info("Sampled %d of %d images for identity profile", len(loaded_vision), len(loaded))
+    # Vision model is slow with many images — process in batches of 5 (a size known
+    # to work) and merge the per-batch descriptions into one identity profile.
+    IDENTITY_BATCH = 5
+    profile_parts = []
+    anchor_candidates = []  # (filename, score-ish order) from each batch
+    all_uris = [_downscale_uri(d) for d, _, _ in loaded]
+    for start in range(0, len(all_uris), IDENTITY_BATCH):
+        batch = all_uris[start:start + IDENTITY_BATCH]
+        batch_names = [loaded[start + i][1] for i in range(len(batch))]
+        instruction = (
+            f"下面是同一个人的 {len(batch)} 张照片（文件名：{', '.join(batch_names)}）。\n"
+            "请完成两个任务并只输出一个 JSON 对象：\n"
+            '{"profile": "...", "anchor": "<文件名>"}\n'
+            "1) profile: 用中文描述这张/这些照片中此人的身份特征：脸型、眼型/眼距、眉形、鼻型、"
+            "嘴唇、下颌、发型发色、肤色、体态/肩型，以及任何标志性特征（痣、酒窝等）。"
+            "如果本批有多张照片，综合描述共有的身份特征，并补充各张独有的细节。\n"
+            "2) anchor: 从本批照片中选出最适合作为身份锚点的一张——正面朝向镜头、面部清晰、"
+            "光线好、表情自然、无遮挡。若本批没有合适的（如都是侧面/远景），返回 null。"
+            "返回该照片的文件名（必须来自上述列表）。\n"
+        )
+        try:
+            raw = _chat_with_images(instruction, batch, max_tokens=900)
+        except Exception as e:
+            logger.warning("Identity batch %d chat failed: %s", start // IDENTITY_BATCH, e)
+            continue
+        parsed = _parse_json_obj(raw) or {}
+        part = str(parsed.get("profile") or raw).strip()
+        if part:
+            profile_parts.append(part)
+        anch = str(parsed.get("anchor") or "").strip()
+        if anch and any(anch.lower() in n.lower() or n.lower() in anch.lower() for n in batch_names):
+            anchor_candidates.append(anch)
 
-    vision_uris = [_downscale_uri(d) for d, _, _ in loaded_vision]
-    instruction = (
-        "下面是同一个人的多张照片。请完成两个任务并只输出一个 JSON 对象：\n"
-        '{"profile": "...", "anchor": "<文件名>"}\n'
-        "1) profile: 用中文详细描述此人的身份特征：脸型、眼型/眼距、眉形、鼻型、嘴唇、下颌、"
-        "发型发色、肤色、体态/肩型、身高比例感，以及任何标志性特征（痣、酒窝、胎记等）。"
-        "要足够具体，使仅凭这段文字就能重建出这个人。\n"
-        "2) anchor: 从以上照片中选出最适合作为身份锚点的一张——要求：正面朝向镜头、面部清晰、"
-        "光线好、表情自然、无遮挡。返回该照片的文件名（如 xxx.jpg），必须来自上述照片之一。\n"
-    )
-    try:
-        raw = _chat_with_images(instruction, vision_uris, max_tokens=1500)
-    except Exception as e:
-        return _err("api", f"identity profile chat failed: {e}")
-    parsed = _parse_json_obj(raw) or {}
-    profile = str(parsed.get("profile") or raw).strip()[:2000]
-    anchor_name = str(parsed.get("anchor") or "").strip()
+    if not profile_parts:
+        return _err("api", "identity profile could not be produced from any batch")
+    profile = "\n".join(profile_parts)[:2500]
 
-    # anchor 来自视觉模型看到的抽样集合；context 用全量图（视觉记忆）
-    anchor_idx = 0
-    for i, (_, name, _) in enumerate(loaded_vision):
-        if anchor_name and (name.lower() in anchor_name.lower()
-                            or anchor_name.lower() in name.lower()):
-            anchor_idx = i
+    # Anchor: prefer candidates reported by batches; fall back to first photo.
+    anchor_path = loaded[0][2]
+    anchor_name = ""
+    for cand in anchor_candidates:
+        for i, (_, name, path) in enumerate(loaded):
+            if cand.lower() in name.lower() or name.lower() in cand.lower():
+                anchor_path = path
+                anchor_name = name
+                break
+        if anchor_name:
             break
-    anchor_item = loaded_vision[anchor_idx]
-    anchor_path = anchor_item[2]
     context_paths = [loaded[i][2] for i in range(len(loaded))
                      if loaded[i][2] != anchor_path]
 
     templates = []
-    for desc, pose in IDENTITY_TEMPLATE_PRESETS[:count]:
-        intent = (
-            f"生成一张{desc}：{pose}。\n"
-            "要求：背景统一为浅灰色纯色幕布（无任何图案、纹理、文字）；"
-            "穿着统一为简单的纯白色圆领上衣（无图案无logo）；"
-            "面部必须是参考人物的真实身份（严格按身份画像的五官特征）；"
-            "忽略参考图中原有的服装、背景、光线、色调，只保留人物的面部与体态身份特征。"
-        )
-        out = ark_edit_image(
-            intent=intent,
-            image=anchor_path,
-            size="1024x1536",
-            scene_profile=profile,
-            context_images=",".join(context_paths) if context_paths else None,
-        )
-        if out.get("ok"):
-            files = out.get("files") or []
-            templates.append({"preset": desc, "file": files[0] if files else None,
-                              "refined_prompt": out.get("refined_prompt")})
-        else:
-            templates.append({"preset": desc, "error": out.get("error")})
+    # 输出目录：优先存到输入图所在目录，方便把模板和原图放一起
+    output_dir = os.path.dirname(os.path.abspath(anchor_path)) or os.getcwd()
+    os.makedirs(output_dir, exist_ok=True)
+    prev_cwd = os.getcwd()
+    os.chdir(output_dir)  # ark_edit_image saves to cwd; run inside the input folder
 
-    return _ok(identity_profile=profile, anchor=anchor_item[1],
-               templates=templates, total=len(templates))
+    templates = []
+    try:
+        for desc, pose in IDENTITY_TEMPLATE_PRESETS[:count]:
+            intent = (
+                f"生成一张{desc}：{pose}。\n"
+                "要求：整体呈自然生活照质感，不是证件照——背景为柔和的自然室内/户外中性环境"
+                "（如素雅的米白色墙面、虚化的自然光，无任何图案、文字、logo）；"
+                "穿着为简约的自然色系便装（如浅色基础款，无图案无logo，不要正式西装或制服）；"
+                "表情自然放松，光线柔和自然，符合日常真实照片的质感；"
+                "面部必须是参考人物的真实身份（严格按身份画像的五官特征）；"
+                "忽略参考图中原有的服装、背景、光线、色调，只保留人物的面部与体态身份特征。"
+            )
+            out = ark_edit_image(
+                intent=intent,
+                image=anchor_path,
+                size="1024x1536",
+                scene_profile=profile,
+                context_images=",".join(context_paths) if context_paths else None,
+            )
+            if out.get("ok"):
+                files = out.get("files") or []
+                tpl_file = files[0] if files else None
+                templates.append({"preset": desc, "file": tpl_file,
+                                  "refined_prompt": out.get("refined_prompt")})
+            else:
+                templates.append({"preset": desc, "error": out.get("error")})
+    finally:
+        os.chdir(prev_cwd)
+
+    return _ok(identity_profile=profile, anchor=os.path.basename(anchor_path),
+               output_dir=output_dir, templates=templates, total=len(templates))
 
 
 def main() -> None:
