@@ -302,21 +302,36 @@ def _downscale_uri(img_data: bytes, max_dim: int = 1024, quality: int = 85) -> s
     return f"data:image/jpeg;base64,{base64.b64encode(buf.getvalue()).decode()}"
 
 
-def _chat_with_images(user_text: str, image_uris: list, max_tokens: int = 2000) -> str:
-    """Call the multimodal chat model (ARK_VISION_MODEL) with text and multiple images."""
-    content = [{"type": "image_url", "image_url": {"url": u}} for u in image_uris]
-    content.append({"type": "text", "text": user_text})
+def _chat_with_images(user_text: str, image_uris: list, max_tokens: int = 2000,
+                      timeout: int = 300) -> str:
+    """Call the multimodal chat model (ARK_VISION_MODEL) with text and multiple images.
+    Retries once on 429 (vision service is rate-limited/flaky)."""
     headers = {"Content-Type": "application/json", "Authorization": f"Bearer {ARK_API_KEY}"}
     body = {
         "model": ARK_VISION_MODEL,
-        "messages": [{"role": "user", "content": content}],
+        "messages": [{
+            "role": "user",
+            "content": [{"type": "image_url", "image_url": {"url": u}} for u in image_uris]
+                     + [{"type": "text", "text": user_text}],
+        }],
         "max_tokens": max_tokens,
         "temperature": 0.3,
     }
-    resp = requests.post(f"{ARK_API_BASE}/chat/completions", headers=headers, json=body,
-                         timeout=(30, 300))
-    resp.raise_for_status()
-    return resp.json()["choices"][0]["message"]["content"]
+    for attempt in range(2):
+        try:
+            resp = requests.post(f"{ARK_API_BASE}/chat/completions", headers=headers, json=body,
+                                 timeout=(30, timeout))
+        except requests.exceptions.RequestException:
+            if attempt == 0:  # vision service occasionally times out; retry once
+                time.sleep(3)
+                continue
+            raise
+        if resp.status_code == 429 and attempt == 0:
+            time.sleep(5)
+            continue
+        resp.raise_for_status()
+        return resp.json()["choices"][0]["message"]["content"]
+    raise RuntimeError("vision chat failed after retries")
 
 
 @mcp.tool()
@@ -1049,6 +1064,132 @@ def ark_verify_edit(
         return _ok(passed=None, reasons=[], summary=raw.strip()[:300], raw=raw)
     return _ok(passed=result.get("passed"), reasons=result.get("reasons", []),
                summary=result.get("summary", ""), raw=None)
+
+
+IDENTITY_TEMPLATE_PRESETS = [
+    ("正脸头肩照", "正面直视镜头，头部肩部特写，标准证件照式正脸"),
+    ("四分之三侧头肩照", "四分之三侧面，微微侧头，头肩部特写"),
+    ("纯侧面轮廓照", "正侧面轮廓，头肩部特写"),
+    ("全身正面站立照", "全身正面站立，自然站姿，从头部到脚"),
+    ("微笑正脸头肩照", "正脸微笑，头肩部特写"),
+]
+
+
+MAX_VISION_IMAGES = 5  # vision model is flaky with many images in one request
+
+
+def _sample_images(items: list, limit: int = MAX_VISION_IMAGES) -> list:
+    """Evenly sample at most `limit` items from a list (keeps angle variety)."""
+    if len(items) <= limit:
+        return items
+    step = len(items) / limit
+    return [items[int(i * step)] for i in range(limit)]
+
+
+@mcp.tool()
+def ark_generate_identity_templates(
+    images: str,
+    count: int = 3,
+) -> dict:
+    """Generate standardized identity template images from multiple photos of one person.
+
+    Pipeline:
+    1) The vision model reads all photos, produces an identity profile (facial
+       features, body type, hair, distinctive traits) and picks the best front-facing
+       anchor photo.
+    2) For each preset (front headshot, three-quarter, side, full body...), the anchor
+       photo is the main reference, the other photos are visual memory, and the
+       identity profile is the text lock; the template is generated with a NEUTRAL
+       background/attire so clothing/background leakage is avoided at the source.
+    Templates are meant for human review — pick the best 2-4 and reuse them as the
+    reference for ark_edit_image to generate portraits.
+
+    Args:
+        images: Comma-separated local paths or URLs of the person's photos
+        count: How many templates to generate (1-5), from the preset list in order
+    """
+    if not ARK_API_KEY:
+        return _err("config", "ARK_API_KEY environment variable is not set.")
+    if not images or not images.strip():
+        return _err("invalid_argument", "images must not be empty.")
+    if not (1 <= count <= len(IDENTITY_TEMPLATE_PRESETS)):
+        return _err("invalid_argument",
+                    f"count must be 1-{len(IDENTITY_TEMPLATE_PRESETS)}.")
+
+    sources = [s.strip() for s in images.split(",")]
+    loaded = []
+    problems = []
+    for src in sources:
+        try:
+            data, label = load_input_image(src)
+            loaded.append((data, os.path.basename(label), label))
+        except Exception as e:
+            problems.append(f"{src}: {e}")
+    if not loaded:
+        return _err("load", f"no images could be loaded: {problems}")
+    if problems:
+        logger.warning("ark_generate_identity_templates: some images failed: %s", problems)
+
+    # Vision model is flaky with many images — sample evenly to keep angle variety.
+    loaded_vision = _sample_images(loaded, MAX_VISION_IMAGES)
+    if len(loaded_vision) < len(loaded):
+        logger.info("Sampled %d of %d images for identity profile", len(loaded_vision), len(loaded))
+
+    vision_uris = [_downscale_uri(d) for d, _, _ in loaded_vision]
+    instruction = (
+        "下面是同一个人的多张照片。请完成两个任务并只输出一个 JSON 对象：\n"
+        '{"profile": "...", "anchor": "<文件名>"}\n'
+        "1) profile: 用中文详细描述此人的身份特征：脸型、眼型/眼距、眉形、鼻型、嘴唇、下颌、"
+        "发型发色、肤色、体态/肩型、身高比例感，以及任何标志性特征（痣、酒窝、胎记等）。"
+        "要足够具体，使仅凭这段文字就能重建出这个人。\n"
+        "2) anchor: 从以上照片中选出最适合作为身份锚点的一张——要求：正面朝向镜头、面部清晰、"
+        "光线好、表情自然、无遮挡。返回该照片的文件名（如 xxx.jpg），必须来自上述照片之一。\n"
+    )
+    try:
+        raw = _chat_with_images(instruction, vision_uris, max_tokens=1500)
+    except Exception as e:
+        return _err("api", f"identity profile chat failed: {e}")
+    parsed = _parse_json_obj(raw) or {}
+    profile = str(parsed.get("profile") or raw).strip()[:2000]
+    anchor_name = str(parsed.get("anchor") or "").strip()
+
+    # anchor 来自视觉模型看到的抽样集合；context 用全量图（视觉记忆）
+    anchor_idx = 0
+    for i, (_, name, _) in enumerate(loaded_vision):
+        if anchor_name and (name.lower() in anchor_name.lower()
+                            or anchor_name.lower() in name.lower()):
+            anchor_idx = i
+            break
+    anchor_item = loaded_vision[anchor_idx]
+    anchor_path = anchor_item[2]
+    context_paths = [loaded[i][2] for i in range(len(loaded))
+                     if loaded[i][2] != anchor_path]
+
+    templates = []
+    for desc, pose in IDENTITY_TEMPLATE_PRESETS[:count]:
+        intent = (
+            f"生成一张{desc}：{pose}。\n"
+            "要求：背景统一为浅灰色纯色幕布（无任何图案、纹理、文字）；"
+            "穿着统一为简单的纯白色圆领上衣（无图案无logo）；"
+            "面部必须是参考人物的真实身份（严格按身份画像的五官特征）；"
+            "忽略参考图中原有的服装、背景、光线、色调，只保留人物的面部与体态身份特征。"
+        )
+        out = ark_edit_image(
+            intent=intent,
+            image=anchor_path,
+            size="1024x1536",
+            scene_profile=profile,
+            context_images=",".join(context_paths) if context_paths else None,
+        )
+        if out.get("ok"):
+            files = out.get("files") or []
+            templates.append({"preset": desc, "file": files[0] if files else None,
+                              "refined_prompt": out.get("refined_prompt")})
+        else:
+            templates.append({"preset": desc, "error": out.get("error")})
+
+    return _ok(identity_profile=profile, anchor=anchor_item[1],
+               templates=templates, total=len(templates))
 
 
 def main() -> None:

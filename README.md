@@ -134,6 +134,7 @@ env = { ARK_API_KEY = "ark-..." }
 | `ark_revise_image` | Iterate on a previous result from feedback | `revision`, `image`, `reference`, `size`, `scene_profile` |
 | `ark_capture_screen` | Capture the screen (or a region) as a PNG | `region`, `max_dim` |
 | `ark_verify_edit` | Verify an edit against the original + intent (QA loop) | `original`, `edited`, `intent` |
+| `ark_generate_identity_templates` | Build standardized identity template images from many photos | `images`, `count` |
 | `ark_generate_image` | Direct text/image-to-image generation | `prompt`, `image`, `size`, `response_format` |
 
 ### Spatial & memory features
@@ -168,6 +169,28 @@ Screenshots are saved as `ark_screen_*.png` in the caller's working directory.
 `region="[x1,y1,x2,y2]"` (0-1000 normalized) captures only part of the screen.
 Requires a platform with `PIL.ImageGrab` (Windows/macOS); on others the tool
 returns a clear error.
+
+### Identity templates → portraits (person-consistent generation)
+
+`ark_generate_identity_templates(images, count)` builds **standardized identity
+template images** from many photos of one person (like the Doubao app's avatar
+feature, but with leakage control):
+
+1. The vision model reads the photos, writes a detailed identity profile
+   (facial features, body, hair, distinctive traits), and picks the best
+   front-facing **anchor** photo.
+2. For each preset (front headshot, three-quarter, side, full body, smiling),
+   the anchor is the main reference + the other photos are visual memory +
+   the identity profile is the text lock — generated with a **neutral light-grey
+   background and plain white top**, so clothing/background leakage is avoided
+   at the source (the Doubao approach's known weakness).
+3. **Human review**: pick the best 2-4 templates, then reuse them as
+   `image` (with `scene_profile=identity_profile`) in `ark_edit_image` to
+   generate portraits of that person in any outfit/scene.
+
+> Note: this is "reference-based identity distillation", not a trained LoRA.
+> Identity fidelity is strongest when the target pose/framing is close to the
+> template; extreme pose changes (back view, strong side) degrade fidelity.
 
 ### Recommended workflow
 
