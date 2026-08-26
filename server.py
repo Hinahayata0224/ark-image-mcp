@@ -419,6 +419,34 @@ def refine_edit_prompt(img_data: bytes, intent: str, scene_profile: Optional[str
     return _chat_with_image(instruction, uri)
 
 
+def refine_portrait_prompt(identity_data: bytes, style_uri: str,
+                           scene_profile: str, extra_intent: Optional[str]) -> str:
+    """Rewrite a portrait generation request into a detailed English prompt.
+
+    FIRST image = identity template (keep the face/body); SECOND image = style
+    reference (copy pose/outfit/scene/lighting); scene_profile = text lock on the
+    face. Roles are explicit so the face is never taken from the style image.
+    """
+    uri = to_base64_data_uri(identity_data)
+    instruction = (
+        "You are a professional image-editing prompt engineer. The FIRST image is an IDENTITY "
+        "TEMPLATE of a person (their face and body are the identity to preserve). The SECOND image "
+        "is a STYLE REFERENCE (its pose, outfit, scene, lighting, and mood are to be copied). "
+        "Rewrite the user's request into ONE detailed English prompt for image-to-image generation. "
+        "Requirements:\n"
+        "1) The person in the output must be EXACTLY the person from the FIRST image — same face, "
+        "same facial features, same body. Never use the face or identity of the SECOND (style) image.\n"
+        "2) The pose, composition, outfit, scene/background, and lighting of the output follow the "
+        "SECOND (style) image — the person is re-posed/re-dressed into that style.\n"
+        "3) Describe the outfit/scene from the style image in detail so it is reproduced faithfully.\n"
+        "4) Use the identity profile below to lock facial details precisely.\n"
+        "5) Output ONLY the prompt text - no explanations, no prefixes, no quotation marks.\n\n"
+        f"[Scene profile] {scene_profile}\n"
+        f"[Request] {extra_intent or 'generate a natural lifestyle portrait in the style of the second image'}"
+    )
+    return _chat_with_images(instruction, [uri, style_uri], max_tokens=1500)
+
+
 def refine_edit_prompt_with_context(img_data: bytes, intent: str,
                                     scene_profile: Optional[str],
                                     context_uris: list) -> str:
@@ -1064,6 +1092,98 @@ def ark_verify_edit(
         return _ok(passed=None, reasons=[], summary=raw.strip()[:300], raw=raw)
     return _ok(passed=result.get("passed"), reasons=result.get("reasons", []),
                summary=result.get("summary", ""), raw=None)
+
+
+@mcp.tool()
+def ark_portrait_from_ref(
+    image: str,
+    style_ref: str,
+    scene_profile: str,
+    intent: Optional[str] = None,
+    size: str = "2K",
+    watermark: bool = False,
+) -> ImageResult:
+    """Generate a portrait of a person (from their identity template) in the style of a
+    reference image.
+
+    The identity comes from `image` (an identity template built by
+    ark_generate_identity_templates — the face/body to keep) plus `scene_profile`
+    (the identity profile text); the STYLE comes from `style_ref` (pose, outfit,
+    scene, lighting to copy). The roles are fixed so the face is never swapped with
+    the style reference's face.
+
+    Args:
+        image: Identity template image of the person (face/body to preserve)
+        style_ref: Style reference image (pose/outfit/scene/lighting to follow)
+        scene_profile: Identity profile text from ark_generate_identity_templates
+        intent: Optional extra instructions (e.g. outfit/scene specifics)
+        size: Image size. Square presets "1K"/"2K"/"4K" or "WIDTHxHEIGHT"
+        watermark: Whether to add watermark
+    """
+    if not ARK_API_KEY:
+        return _err("config", "ARK_API_KEY environment variable is not set.")
+    if not image or not image.strip():
+        return _err("invalid_argument", "image is required.")
+    if not style_ref or not style_ref.strip():
+        return _err("invalid_argument", "style_ref is required.")
+    if not scene_profile or not scene_profile.strip():
+        return _err("invalid_argument", "scene_profile is required.")
+    if not is_valid_size(size):
+        return _err("invalid_argument",
+                    f"invalid size '{size}'. Valid options: square presets 1K/2K/4K "
+                    f"or WIDTHxHEIGHT with each side 512-4096.")
+
+    output_dir = os.getcwd()
+    os.makedirs(output_dir, exist_ok=True)
+
+    notes = []
+    try:
+        data, label = load_input_image(image)
+        short_label = label[:60] + "..." if len(label) > 60 else label
+        compressed, was_compressed = maybe_compress(data)
+        if was_compressed:
+            notes.append(f"Identity template modified (dim >= {MAX_INPUT_DIM}px resized): {short_label}")
+        processed = to_base64_data_uri(compressed)
+    except Exception as e:
+        return _err("load", f"failed to load identity template {image}: {e}")
+
+    # style_ref 作为视觉记忆（context），身份图为主参考
+    context_uris = []
+    try:
+        sdata, _ = load_input_image(style_ref)
+        context_uris.append(_downscale_uri(sdata))
+    except Exception as e:
+        return _err("load", f"failed to load style reference {style_ref}: {e}")
+
+    base_intent = (
+        "生成一张写真：人物的脸与上半身身份必须严格来自第一张参考图（身份模板）中的人，"
+        "严格保持其五官特征与身形，绝不要变成其他任何人的脸；"
+        "姿势、构图、服装风格、场景氛围参考第二张风格参考图；"
+        "整体自然真实的生活照质感，光线柔和，无伪影。"
+    )
+    if intent and intent.strip():
+        base_intent += f"\n额外要求：{intent.strip()}"
+
+    refined_prompt = None
+    try:
+        logger.info("Refining portrait prompt with vision model %s", ARK_VISION_MODEL)
+        refined_prompt = refine_portrait_prompt(
+            compressed, context_uris[0], scene_profile,
+            (intent + "\n" + base_intent) if intent and intent.strip() else base_intent)
+    except Exception as e:
+        notes.append(f"Prompt refinement failed, using raw intent instead: {e}")
+
+    payload = {
+        "model": ARK_MODEL,
+        "prompt": refined_prompt if refined_prompt else base_intent,
+        "image": processed,
+        "response_format": "url",
+        "size": size,
+        "watermark": watermark,
+    }
+    extra = {"refined_prompt": refined_prompt} if refined_prompt else None
+    logger.info("Generating portrait: size=%s model=%s", size, ARK_MODEL)
+    return _generate_images(payload, output_dir, notes, extra)
 
 
 IDENTITY_TEMPLATE_PRESETS = [

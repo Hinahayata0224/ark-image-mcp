@@ -46,3 +46,12 @@ def test_template_presets_waist_and_arms():
     assert "腰部" in server.IDENTITY_TEMPLATE_PRESETS[0][1]
     assert "手臂" in server.IDENTITY_TEMPLATE_PRESETS[0][1]
     assert "四十五度" in server.IDENTITY_TEMPLATE_PRESETS[1][0]
+
+
+def test_portrait_roles_are_explicit():
+    # ark_portrait_from_ref 的指令必须明确：第一张=身份、第二张=风格
+    import inspect
+    src = inspect.getsource(server.refine_portrait_prompt)
+    assert "IDENTITY" in src and "identity to preserve" in src
+    assert "STYLE REFERENCE" in src
+    assert "Never use the face or identity of the SECOND" in src
