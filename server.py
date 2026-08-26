@@ -1074,6 +1074,18 @@ IDENTITY_TEMPLATE_PRESETS = [
     ("正面全身像", "正面朝向镜头全身入画，自然站姿，双臂自然垂放，手臂完整不被切出画面"),
 ]
 
+_PRESET_SLUGS = {
+    "正面半身像": "front_half",
+    "四十五度侧面半身像": "side45_half",
+    "正面微笑半身像": "front_smile",
+    "四十五度侧面微笑半身像": "side45_smile",
+    "正面全身像": "full_body",
+}
+
+
+def _preset_slug(desc: str) -> str:
+    return _PRESET_SLUGS.get(desc, "tpl")
+
 
 MAX_VISION_IMAGES = 5  # vision model is flaky with many images in one request
 
@@ -1230,6 +1242,16 @@ def ark_generate_identity_templates(
             if out.get("ok"):
                 files = out.get("files") or []
                 tpl_file = files[0] if files else None
+                # 重命名为可辨识的模板名：identity_tpl_<preset>_<ts>.jpg
+                if tpl_file and os.path.exists(tpl_file):
+                    slug = _preset_slug(desc)
+                    new_name = f"identity_tpl_{slug}_{int(time.time())}.jpg"
+                    new_path = os.path.join(os.path.dirname(tpl_file), new_name)
+                    try:
+                        os.rename(tpl_file, new_path)
+                        tpl_file = new_path
+                    except OSError:
+                        pass  # 重命名失败则保留原文件名
                 templates.append({"preset": desc, "file": tpl_file,
                                   "refined_prompt": out.get("refined_prompt")})
             else:

@@ -4,7 +4,10 @@ import server
 
 def test_identity_presets():
     assert len(server.IDENTITY_TEMPLATE_PRESETS) == 5
-    assert server.IDENTITY_TEMPLATE_PRESETS[0][0] == "正脸头肩照"
+    assert server.IDENTITY_TEMPLATE_PRESETS[0][0] == "正面半身像"
+    assert "腰部" in server.IDENTITY_TEMPLATE_PRESETS[0][1]
+    assert "手臂" in server.IDENTITY_TEMPLATE_PRESETS[0][1]
+    assert "四十五度" in server.IDENTITY_TEMPLATE_PRESETS[1][0]
 
 
 def test_count_validation():
