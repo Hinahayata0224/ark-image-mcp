@@ -4,7 +4,7 @@ version = "0.2.0"
 description = "MCP server for 火山方舟 (Volcano Ark) Doubao-Seedream image generation and editing"
 readme = "README.md"
 requires-python = ">=3.10"
-license = { text = "MIT" }
+license = { text = "GPL-3.0-or-later" }
 authors = [{ name = "Hinahayata0224" }]
 keywords = ["mcp", "image-generation", "seedream", "volcengine", "ark"]
 dependencies = [

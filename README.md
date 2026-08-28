@@ -232,4 +232,4 @@ uv run python -c "import server; print(server.ark_generate_image('a red apple'))
 
 ## License
 
-[MIT](LICENSE)
+[GPL-3.0](LICENSE)
