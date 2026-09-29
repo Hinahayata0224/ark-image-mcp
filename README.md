@@ -25,6 +25,9 @@ faithful, detailed prompts.
   photos of the same scene/person, then pass it into edits for consistency.
 - EXIF rotation correction, large-image downscaling, retries with backoff, and
   structured JSON responses (`ok` / `error_type`).
+- **Optional image hosting**: upload results to a private bucket and return
+  time-limited signed URLs, so images can be opened from a phone or a chat
+  channel that only renders text. Disabled unless you configure it.
 
 ## Models
 
@@ -55,6 +58,36 @@ Environment variables:
 | `ARK_MODEL` | `doubao-seedream-5-0-pro-260628` | Generation model |
 | `ARK_VISION_MODEL` | `doubao-seed-2-1-pro-260628` | Vision (chat) model |
 | `ARK_TIMEOUT` | `300` | Generation request timeout (s) |
+
+### Optional image hosting
+
+Set `ARK_UPLOAD_PROVIDER` to also upload every generated image and get back a
+`share_urls` list in the response. Local files are still saved exactly as before,
+and any upload error is reported in `notes` instead of failing the request.
+
+**`aliyun`** — Alibaba Cloud OSS with a **private** bucket. The bucket's bare URLs
+are useless; each returned link is signed and expires after `ARK_OSS_URL_TTL`
+(7 days by default). Create the bucket with *Block Public Access* **on** and a
+private ACL.
+
+| Variable | Description |
+|---|---|
+| `ARK_UPLOAD_PROVIDER` | `aliyun`, `cloudinary`, or `smms` |
+| `ARK_OSS_ACCESS_KEY_ID` / `ARK_OSS_ACCESS_KEY_SECRET` | RAM credentials |
+| `ARK_OSS_BUCKET` | Bucket name |
+| `ARK_OSS_ENDPOINT` | e.g. `https://oss-cn-shenzhen.aliyuncs.com` |
+| `ARK_OSS_PREFIX` | Object key prefix (default `ark/`) |
+| `ARK_OSS_URL_TTL` | Signed URL lifetime in seconds (default `604800`) |
+
+Use a RAM sub-account whose policy is limited to this bucket rather than an
+account-wide AccessKey.
+
+**`cloudinary`** — unsigned upload preset. Set `ARK_CLOUDINARY_PRESET` (and
+optionally `ARK_CLOUDINARY_CLOUD`). Note that Cloudinary assets are **public by
+default**; this backend is not appropriate for private images.
+
+**`smms`** — SM.MS v2 API. Set `ARK_SMMS_TOKEN`. SM.MS is no longer keyless; the
+v1 endpoint is retired.
 
 ## MCP client setup (stdio)
 

@@ -13,6 +13,8 @@ from pydantic import BaseModel, Field
 import requests
 from mcp.server.fastmcp import FastMCP
 
+from uploader import describe_config, upload_paths
+
 mcp = FastMCP(
     "ark-image-gen",
     instructions=(
@@ -44,6 +46,9 @@ mcp = FastMCP(
         "- Output images are saved to the caller's current working directory as ark_img_*.jpg; the report "
         "includes files, usage, notes, and refined_prompt (the actual prompt the vision model wrote - "
         "review it to verify intent fidelity).\n"
+        "- If image hosting is configured, the report also carries share_urls (public links) and a "
+        "hosting block. Surface share_urls verbatim when the user needs to view an image from another "
+        "device or chat app, since local file paths do not open on a phone.\n"
         "- ALL tools return a JSON object: {\"ok\": true/false, ...}. On success the object carries the "
         "result fields (files, usage, notes, refined_prompt, ...); on failure it carries "
         "{\"ok\": false, \"error_type\": \"config|invalid_argument|load|api\", \"error\": \"message\"}. "
@@ -95,7 +100,7 @@ def _err(error_type: str, message: str) -> dict:
     return {"ok": False, "error_type": error_type, "error": message,
             "files": None, "urls": None, "usage": None, "notes": None,
             "model": None, "created": None, "refined_prompt": None, "errors": None,
-            "profile": None, "images": None}
+            "profile": None, "images": None, "share_urls": None, "hosting": None}
 
 
 def _ok(**fields) -> dict:
@@ -766,6 +771,21 @@ def _generate_images(payload: dict, output_dir: str, notes: Optional[list] = Non
         "usage": result.get("usage"),
         "notes": notes if notes else None,
     }
+
+    # Optional image hosting (off unless ARK_UPLOAD_PROVIDER is set). Uploaded
+    # public links land in share_urls so they survive a chat channel that only
+    # renders text, such as the WeChat bot.
+    hosting = describe_config()
+    if hosting["enabled"] and local_paths:
+        share_urls, notes = upload_paths(local_paths, notes)
+        if share_urls:
+            info["share_urls"] = share_urls
+        info["hosting"] = {"provider": hosting["provider"]}
+    elif hosting["enabled"]:
+        info["hosting"] = {"provider": hosting["provider"], "detail": "no local files to upload"}
+
+    if notes:
+        info["notes"] = notes
     if extra_info:
         info.update(extra_info)
     if errors:

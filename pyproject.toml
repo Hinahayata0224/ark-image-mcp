@@ -1,6 +1,6 @@
 [project]
 name = "ark-image-mcp"
-version = "0.2.0"
+version = "0.3.0"
 description = "MCP server for 火山方舟 (Volcano Ark) Doubao-Seedream image generation and editing"
 readme = "README.md"
 requires-python = ">=3.10"
@@ -11,6 +11,9 @@ dependencies = [
     "mcp[cli]>=1.6.0",
     "requests>=2.31.0",
     "pillow>=10.0.0",
+    # Optional: only needed for the `aliyun` image-hosting backend. Imported
+    # lazily, so the other providers work without it.
+    "oss2>=2.19.0",
 ]
 
 [dependency-groups]
