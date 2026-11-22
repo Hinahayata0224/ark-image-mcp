@@ -1,6 +1,6 @@
 [project]
 name = "ark-image-mcp"
-version = "0.5.0"
+version = "0.5.1"
 description = "MCP server for 火山方舟 (Volcano Ark) Doubao-Seedream image generation and editing"
 readme = "README.md"
 requires-python = ">=3.10"

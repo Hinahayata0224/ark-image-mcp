@@ -62,6 +62,52 @@ def test_absolute_missing_path_also_hinted(tmp_path):
         server.load_input_image(str(tmp_path / "nope.jpg"))
 
 
+def test_error_message_carries_a_runnable_command(tmp_path, monkeypatch):
+    """The model should not have to discover /upload: the error tells it what to run."""
+    monkeypatch.setenv("ARK_PUBLIC_BASE_URL", "https://mcp.example.com")
+    monkeypatch.setattr(server, "ARK_PUBLIC_BASE_URL", "https://mcp.example.com")
+    monkeypatch.setattr(server, "ARK_UPLOAD_TOKEN", "upload-tok")
+    with pytest.raises(ValueError) as exc:
+        server.load_input_image("input/photo.jpg")
+    msg = str(exc.value)
+    assert "https://mcp.example.com/upload" in msg
+    assert "Bearer upload-tok" in msg
+    assert "--data-binary" in msg
+
+
+def test_instructions_lead_with_the_upload_workflow(monkeypatch):
+    """A client that skim-reads instructions must still hit the upload path."""
+    text = server.mcp.instructions
+    assert "READ THIS FIRST" in text
+    lead = text[: text.index("READ THIS FIRST")]
+    assert "ark_scene_profile" not in lead  # tools listing comes after the warning
+    assert "/upload" in text[:1400]
+
+
+# ---------- transparency ----------
+
+def test_rgba_png_downscales_to_jpeg_instead_of_raising():
+    """Phones and screenshots produce RGBA PNGs; JPEG cannot store alpha."""
+    buf = io.BytesIO()
+    Image.new("RGBA", (120, 90), (255, 0, 0, 128)).save(buf, format="PNG")
+    uri = server._downscale_uri(buf.getvalue())
+    assert uri.startswith("data:image/jpeg;base64,")
+
+
+def test_rgba_png_survives_display_reencode():
+    buf = io.BytesIO()
+    Image.new("RGBA", (120, 90), (0, 0, 255, 200)).save(buf, format="PNG")
+    out = server._to_display_jpeg(buf.getvalue())
+    assert out[:2] == b"\xff\xd8"  # JPEG SOI
+
+
+def test_flatten_composites_alpha_on_white():
+    img = Image.new("RGBA", (10, 10), (255, 0, 0, 0))  # fully transparent red
+    flat = server._flatten_to_rgb(img)
+    assert flat.mode == "RGB"
+    assert flat.getpixel((0, 0)) == (255, 255, 255)
+
+
 # ---------- POST /upload ----------
 
 def _post_upload(body: bytes):

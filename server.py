@@ -41,10 +41,37 @@ ARK_MAX_UPLOAD_MB = int(os.environ.get("ARK_MAX_UPLOAD_MB", "25"))
 # it cannot call tools or spend Ark credits. Falls back to ARK_MCP_TOKEN.
 ARK_UPLOAD_TOKEN = os.environ.get("ARK_UPLOAD_TOKEN", "").strip()
 
+
+def upload_hint(source: str = "<local file>") -> str:
+    """Return a ready-to-run upload command for the current configuration.
+
+    Embedded in the MCP instructions and in load errors, so a client that hits
+    an unreadable path is told exactly what to run instead of having to
+    discover the /upload endpoint on its own.
+    """
+    base = ARK_PUBLIC_BASE_URL
+    if not base:
+        base = (f"http://127.0.0.1:{ARK_PORT}" if ARK_HOST in ("127.0.0.1", "localhost")
+                else f"http://{ARK_HOST}:{ARK_PORT}")
+    token = ARK_UPLOAD_TOKEN or ARK_MCP_TOKEN or "<upload-token>"
+    return (f"curl -sS -X POST '{base}/upload' "
+            f"-H 'Authorization: Bearer {token}' "
+            f"--data-binary '@{source}'")
+
 mcp = FastMCP(
     "ark-image-gen",
     instructions=(
         "MCP server for 火山方舟 (Volcano Ark) Doubao-Seedream image generation and editing.\n\n"
+        "*** READ THIS FIRST IF THE USER ATTACHED A PHOTO ***\n"
+        "This server may run on a DIFFERENT machine than your client. A file the user attached in "
+        "the chat (e.g. 'input/image-abc.jpg', or any workspace-relative path) does NOT exist on the "
+        "server and will fail. Do not guess server paths, do not search the server's disk, and do not "
+        "try to rewrite the relative path. Upload the bytes in ONE step, then use the returned path:\n"
+        "    <UPLOAD_COMMAND>\n"
+        "The JSON reply contains an absolute `path` — pass that as the `image` argument of the tool. "
+        "If the upload returns 401, tell the user the upload token is wrong rather than retrying other "
+        "approaches. Only fall back to a data:/b64: payload for images under ~100 KB: a 200 KB photo "
+        "becomes ~270K characters in a tool argument, which is slow and expensive.\n\n"
         "Two models power this server (handled internally):\n"
         "- Seedream 5.0 pro: generates/edits images (image-to-image).\n"
         "- Doubao Seed 2.1 pro (vision): reads reference images and rewrites edit intent into detailed "
@@ -101,6 +128,8 @@ mcp = FastMCP(
         "result fields (files, usage, notes, refined_prompt, ...); on failure it carries "
         "{\"ok\": false, \"error_type\": \"config|invalid_argument|load|api\", \"error\": \"message\"}. "
         "ark_scene_profile on success returns {\"ok\": true, \"profile\": \"...\", \"images\": N}."
+    ).replace(
+        "<UPLOAD_COMMAND>", upload_hint(),
     ).replace(
         "<PUBLIC_BASE_URL>",
         ARK_PUBLIC_BASE_URL or (f"http://{ARK_HOST}:{ARK_PORT}" if ARK_HOST != "0.0.0.0"
@@ -294,9 +323,12 @@ def load_input_image(source: str) -> tuple:
     if not s.startswith(("http://", "https://")):
         raise ValueError(
             f"not a readable local path on this machine and not an http(s) URL: {s!r}. "
-            "For an image that only exists on the client, send its bytes to this "
-            "server's /upload endpoint first (or pass a data:/b64: payload), then use "
-            "the returned path."
+            "This server runs on a DIFFERENT machine than your client, so a file your client "
+            "can see does not exist here. Upload the bytes, then pass the returned path:\n"
+            f"    {upload_hint()}\n"
+            "The reply is JSON with an absolute `path` field — use that as the `image` argument. "
+            "Reserve data:/b64: payloads for images under ~100 KB; anything larger is far cheaper "
+            "to upload than to inline in a tool call."
         )
     resp = requests.get(s, headers=UA_HEADERS, timeout=120)
     resp.raise_for_status()
@@ -343,7 +375,7 @@ def maybe_compress(img_data: bytes) -> tuple:
             img = img.resize((w, h), PILImage.LANCZOS)
             need_transpose = True  # mark as modified
         buf = io.BytesIO()
-        img.save(buf, format="JPEG", quality=92)
+        _flatten_to_rgb(img).save(buf, format="JPEG", quality=92)
         return buf.getvalue(), need_transpose
     except Exception:
         return img_data, False
@@ -396,11 +428,29 @@ def _chat_with_image(user_text: str, image_data_uri: str, max_tokens: int = 1500
     return resp.json()["choices"][0]["message"]["content"]
 
 
+def _flatten_to_rgb(img):
+    """Convert any PIL image to RGB, compositing transparency onto white.
+
+    JPEG cannot store an alpha channel, so saving an RGBA/P-with-transparency
+    image as JPEG raises "cannot write mode RGBA as JPEG". Phones and screenshot
+    tools produce such files routinely.
+    """
+    if img.mode == "RGB":
+        return img
+    if img.mode in ("RGBA", "LA") or (img.mode == "P" and "transparency" in img.info):
+        rgba = img.convert("RGBA")
+        background = PILImage.new("RGB", rgba.size, (255, 255, 255))
+        background.paste(rgba, mask=rgba.getchannel("A"))
+        return background
+    return img.convert("RGB")
+
+
 def _downscale_uri(img_data: bytes, max_dim: int = 1024, quality: int = 85) -> str:
     """Encode image bytes as a downscaled JPEG data URI (for vision-model calls)."""
     img = PILImage.open(io.BytesIO(img_data))
     img = ImageOps.exif_transpose(img)
     img.thumbnail((max_dim, max_dim), PILImage.LANCZOS)
+    img = _flatten_to_rgb(img)
     buf = io.BytesIO()
     img.save(buf, format="JPEG", quality=quality)
     return f"data:image/jpeg;base64,{base64.b64encode(buf.getvalue()).decode()}"
@@ -733,8 +783,7 @@ def _to_display_jpeg(img_data: bytes, max_dim: int = 1024, quality: int = 82) ->
         return img_data
     img = PILImage.open(io.BytesIO(img_data))
     img = ImageOps.exif_transpose(img)
-    if img.mode not in ("RGB", "L"):
-        img = img.convert("RGB")
+    img = _flatten_to_rgb(img)
     img.thumbnail((max_dim, max_dim), PILImage.LANCZOS)
     buf = io.BytesIO()
     img.save(buf, format="JPEG", quality=quality)
