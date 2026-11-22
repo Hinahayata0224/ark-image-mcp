@@ -3,6 +3,7 @@ import base64
 import asyncio
 import io
 import json
+import os
 
 import pytest
 from PIL import Image
@@ -84,7 +85,62 @@ def test_instructions_lead_with_the_upload_workflow(monkeypatch):
     assert "/upload" in text[:1400]
 
 
-# ---------- transparency ----------
+# ---------- ark_upload_image (bytes over the MCP connection) ----------
+
+def test_mcp_upload_plain_base64(tmp_path, monkeypatch):
+    monkeypatch.setattr(server, "ARK_INPUT_DIR", str(tmp_path))
+    raw = _jpeg_bytes()
+    out = server.ark_upload_image(base64.b64encode(raw).decode(), "photo.jpg")
+    assert out["ok"] is True
+    assert out["bytes"] == len(raw)
+    assert out["path"].startswith(str(tmp_path))
+    assert out["path"].endswith(".jpg")
+    assert open(out["path"], "rb").read() == raw
+
+
+def test_mcp_upload_accepts_data_url(tmp_path, monkeypatch):
+    monkeypatch.setattr(server, "ARK_INPUT_DIR", str(tmp_path))
+    raw = _jpeg_bytes()
+    out = server.ark_upload_image("data:image/jpeg;base64," + base64.b64encode(raw).decode())
+    assert out["ok"] is True
+    assert os.path.getsize(out["path"]) == len(raw)
+
+
+def test_mcp_upload_ignores_whitespace(tmp_path, monkeypatch):
+    """Clients often wrap long base64 lines, which would otherwise fail to decode."""
+    monkeypatch.setattr(server, "ARK_INPUT_DIR", str(tmp_path))
+    b64 = base64.b64encode(_jpeg_bytes()).decode()
+    wrapped = "\n".join(b64[i:i + 76] for i in range(0, len(b64), 76))
+    out = server.ark_upload_image(wrapped)
+    assert out["ok"] is True
+
+
+def test_mcp_upload_rejects_non_image(tmp_path, monkeypatch):
+    monkeypatch.setattr(server, "ARK_INPUT_DIR", str(tmp_path))
+    out = server.ark_upload_image(base64.b64encode(b"not an image").decode())
+    assert out["ok"] is False
+    assert "not a decodable image" in out["error"]
+
+
+def test_mcp_upload_rejects_empty(tmp_path, monkeypatch):
+    monkeypatch.setattr(server, "ARK_INPUT_DIR", str(tmp_path))
+    assert server.ark_upload_image("")["ok"] is False
+
+
+def test_mcp_upload_sanitizes_filename(tmp_path, monkeypatch):
+    """A hostile filename must not escape the input directory."""
+    monkeypatch.setattr(server, "ARK_INPUT_DIR", str(tmp_path))
+    out = server.ark_upload_image(base64.b64encode(_jpeg_bytes()).decode(),
+                                  "../../evil name!.jpg")
+    assert out["ok"] is True
+    assert os.path.dirname(out["path"]) == str(tmp_path)
+
+
+def test_instructions_mention_the_upload_tool():
+    assert "ark_upload_image" in server.mcp.instructions
+
+
+
 
 def test_rgba_png_downscales_to_jpeg_instead_of_raising():
     """Phones and screenshots produce RGBA PNGs; JPEG cannot store alpha."""

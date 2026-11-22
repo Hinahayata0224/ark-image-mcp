@@ -155,9 +155,19 @@ Two things behave differently from stdio:
 
 When the server runs on a different machine than the client, a photo the user
 attached on their phone lives in the *client's* workspace and is unreadable here.
-Three ways to bridge that, in order of practicality:
+Options, in the order the instructions tell a model to try them:
 
-1. **`POST /upload`** — send the raw bytes, get back an absolute server path:
+1. **A public http(s) URL** — if the client can hand you a download link that
+   opens in a browser, pass it straight through. Nothing else needed.
+
+2. **`ark_upload_image(data=<base64>, filename=...)`** — the reliable path on
+   mobile clients. Their sandbox usually has no shell networking, so `curl`
+   cannot reach this server, but MCP tool calls do. The bytes ride the MCP
+   connection; you get back `{"ok": true, "path": "..."}`. Large photos should
+   be downscaled client-side first (~900 px longest side) — that cuts the
+   payload by roughly an order of magnitude with no loss for editing.
+
+3. **`POST /upload`** — for callers that *do* have shell + internet:
 
    ```bash
    curl -sS -X POST 'https://your-host/upload' \
@@ -166,22 +176,15 @@ Three ways to bridge that, in order of practicality:
    # -> {"ok":true,"path":"C:\\...\\input_ab12.jpg","bytes":363258}
    ```
 
-   Give the returned `path` to any editing tool. The body must decode as an
-   image (JPEG/PNG/WebP/GIF/BMP) and the extension is derived from the real
-   format, not from your filename.
+   The body must decode as an image (JPEG/PNG/WebP/GIF/BMP); the extension
+   comes from the detected format, not your filename. `ARK_UPLOAD_TOKEN`
+   authorizes **only** `/upload`, never tool calls, so a remote model can be
+   told it without handing over the session credential.
 
-   `ARK_UPLOAD_TOKEN` exists so a remote model can upload without holding the
-   MCP session credential: it authorizes **only** `/upload`, never tool calls.
-   The token is embedded in the MCP instructions so the model can build the
-   curl command itself — treat it as semi-public within your client.
+4. **`data:` / `b64:` payload** — inline in a tool argument. Only sane below
+   ~100 KB; a 200 KB photo becomes ~270 K characters of JSON.
 
-2. **`data:` URL** — `data:image/jpeg;base64,<payload>`, passed straight as an
-   `image` argument. Fine for small images; a 1 MB photo becomes ~1.4 M
-   characters of tool argument, which is expensive.
-
-3. **`b64:<payload>`** — the same bytes without the `data:` prefix.
-
-Relative paths are rejected with a message pointing at `/upload` rather than
+Relative paths are rejected with a message listing these options rather than
 failing deep inside an HTTP client.
 
 Expose it over HTTPS before using it from a phone — put it behind a reverse

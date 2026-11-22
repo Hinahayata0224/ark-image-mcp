@@ -64,14 +64,22 @@ mcp = FastMCP(
         "MCP server for 火山方舟 (Volcano Ark) Doubao-Seedream image generation and editing.\n\n"
         "*** READ THIS FIRST IF THE USER ATTACHED A PHOTO ***\n"
         "This server may run on a DIFFERENT machine than your client. A file the user attached in "
-        "the chat (e.g. 'input/image-abc.jpg', or any workspace-relative path) does NOT exist on the "
-        "server and will fail. Do not guess server paths, do not search the server's disk, and do not "
-        "try to rewrite the relative path. Upload the bytes in ONE step, then use the returned path:\n"
-        "    <UPLOAD_COMMAND>\n"
-        "The JSON reply contains an absolute `path` — pass that as the `image` argument of the tool. "
-        "If the upload returns 401, tell the user the upload token is wrong rather than retrying other "
-        "approaches. Only fall back to a data:/b64: payload for images under ~100 KB: a 200 KB photo "
-        "becomes ~270K characters in a tool argument, which is slow and expensive.\n\n"
+        "the chat (e.g. 'input/image-abc.jpg', or any workspace-relative path) does NOT exist here. "
+        "Do not guess server paths, do not search the server's disk, and do not try to rewrite the "
+        "relative path. Pick the first option that applies:\n"
+        "  1. If your client can give you a PUBLIC http(s) URL for that image (a download link that "
+        "opens in a normal browser), pass that URL as the `image` argument. Zero extra cost — try "
+        "this first if such a link is available.\n"
+        "  2. Otherwise call ark_upload_image(data=<base64 of the file>, filename='<name>') and pass "
+        "the returned `path` as `image`. This travels over the MCP connection, so it still works "
+        "when your sandbox has no shell networking. This is the normal path on mobile clients.\n"
+        "  3. Only if you have a shell WITH internet access, curl the bytes: <UPLOAD_COMMAND>\n"
+        "Do NOT paste a large base64 blob straight into ark_edit_image's arguments: use "
+        "ark_upload_image once and reuse the short path. If the file is large, downscale it in your "
+        "sandbox before base64-encoding (e.g. to ~900px longest side) — that cuts the payload by "
+        "an order of magnitude and does not hurt editing quality.\n"
+        "ark_upload_image returns {\"ok\": true, \"path\": ...}; if it fails, report the error to the "
+        "user instead of retrying other transports.\n\n"
         "Two models power this server (handled internally):\n"
         "- Seedream 5.0 pro: generates/edits images (image-to-image).\n"
         "- Doubao Seed 2.1 pro (vision): reads reference images and rewrites edit intent into detailed "
@@ -324,11 +332,12 @@ def load_input_image(source: str) -> tuple:
         raise ValueError(
             f"not a readable local path on this machine and not an http(s) URL: {s!r}. "
             "This server runs on a DIFFERENT machine than your client, so a file your client "
-            "can see does not exist here. Upload the bytes, then pass the returned path:\n"
-            f"    {upload_hint()}\n"
-            "The reply is JSON with an absolute `path` field — use that as the `image` argument. "
-            "Reserve data:/b64: payloads for images under ~100 KB; anything larger is far cheaper "
-            "to upload than to inline in a tool call."
+            "can see does not exist here. Do one of these instead:\n"
+            "  * pass a public http(s) URL for the image, or\n"
+            "  * call ark_upload_image(data=<base64 of the file>) and use the returned `path`, or\n"
+            f"  * if you have a shell with internet access: {upload_hint()}\n"
+            "Reserve raw data:/b64: payloads for images under ~100 KB; anything larger is far "
+            "cheaper to upload once than to inline in every tool call."
         )
     resp = requests.get(s, headers=UA_HEADERS, timeout=120)
     resp.raise_for_status()
@@ -788,6 +797,73 @@ def _to_display_jpeg(img_data: bytes, max_dim: int = 1024, quality: int = 82) ->
     buf = io.BytesIO()
     img.save(buf, format="JPEG", quality=quality)
     return buf.getvalue()
+
+
+@mcp.tool()
+def ark_upload_image(data: str, filename: str = "") -> dict:
+    """Store an image that exists only on the client, so the other tools can use it.
+
+    Remote clients often cannot reach this server's /upload endpoint: a mobile
+    sandbox typically has no shell networking even though MCP tool calls work
+    fine. This tool carries the bytes over the MCP connection itself, which is
+    the only channel that reliably exists on both sides.
+
+    Prefer this over inlining base64 into an editing tool's arguments: the
+    payload is sent once, and you get back a short path to reuse.
+
+    Args:
+        data: base64 image bytes. A full `data:image/jpeg;base64,...` URL, a
+              `b64:` prefix, or bare base64 are all accepted; whitespace and
+              newlines are ignored.
+        filename: optional name hint, used only to choose a friendlier stem.
+
+    Returns {"ok": true, "path": "<absolute path on this server>", "bytes": N}.
+    Pass that `path` as the `image` argument of any other tool here.
+    """
+    raw = (data or "").strip()
+    if not raw:
+        return _err("invalid_argument", "data is empty; pass base64 image bytes")
+
+    try:
+        if raw.startswith(("data:", "b64:")):
+            img_data, _ = load_input_image(raw)
+        else:
+            cleaned = re.sub(r"\s+", "", raw)
+            img_data = base64.b64decode(cleaned, validate=False)
+    except Exception as e:
+        return _err("invalid_argument", f"could not decode base64 payload: {e}")
+
+    if not img_data:
+        return _err("invalid_argument", "payload decoded to 0 bytes")
+
+    limit = ARK_MAX_UPLOAD_MB * 1024 * 1024
+    if len(img_data) > limit:
+        return _err("invalid_argument",
+                    f"image is {len(img_data)} bytes, over the {ARK_MAX_UPLOAD_MB} MB limit. "
+                    "Downscale it on the client before uploading.")
+
+    ext = ".jpg"
+    if HAS_PIL:
+        try:
+            probe = PILImage.open(io.BytesIO(img_data))
+            probe.verify()
+            fmt = (probe.format or "JPEG").upper()
+            ext = {"JPEG": ".jpg", "PNG": ".png", "WEBP": ".webp",
+                   "GIF": ".gif", "BMP": ".bmp"}.get(fmt, ".jpg")
+        except Exception as e:
+            return _err("invalid_argument", f"payload is not a decodable image: {e}")
+
+    stem = re.sub(r"[^A-Za-z0-9_-]+", "_", os.path.splitext(os.path.basename(filename))[0])[:40]
+    name = f"{(stem or 'upload')}_{uuid.uuid4().hex[:12]}{ext}"
+    path = os.path.join(_input_dir(), name)
+    try:
+        with open(path, "wb") as fh:
+            fh.write(img_data)
+    except OSError as e:
+        return _err("load", f"could not write upload: {e}")
+
+    logger.info("Received MCP upload: %s (%d bytes)", name, len(img_data))
+    return _ok(path=path, bytes=len(img_data), filename=name)
 
 
 @mcp.tool()
