@@ -68,13 +68,14 @@ wheels = [
 
 [[package]]
 name = "ark-image-mcp"
-version = "0.2.0"
+version = "0.4.0"
 source = { virtual = "." }
 dependencies = [
     { name = "mcp", extra = ["cli"] },
     { name = "oss2" },
     { name = "pillow" },
     { name = "requests" },
+    { name = "uvicorn" },
 ]
 
 [package.dev-dependencies]
@@ -88,6 +89,7 @@ requires-dist = [
     { name = "oss2", specifier = ">=2.19.0" },
     { name = "pillow", specifier = ">=10.0.0" },
     { name = "requests", specifier = ">=2.31.0" },
+    { name = "uvicorn", specifier = ">=0.30.0" },
 ]
 
 [package.metadata.requires-dev]

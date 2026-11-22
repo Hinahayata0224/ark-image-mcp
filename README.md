@@ -106,6 +106,96 @@ v1 endpoint is retired.
 > The server also exposes a full usage manual through MCP `instructions` (returned on
 > `initialize`) — clients/models that read it can use the tools without extra docs.
 
+## Remote setup (HTTP transport)
+
+For clients that cannot spawn a local process — a phone app such as Chatbox, a
+browser, or a machine other than the one running the server — serve the same
+tools over **streamable HTTP**:
+
+| Variable | Default | Description |
+|---|---|---|
+| `ARK_TRANSPORT` | `stdio` | `stdio` (local) or `http` (remote). `sse` also accepted for older clients |
+| `ARK_HOST` | `127.0.0.1` | Bind address; use `0.0.0.0` to accept LAN/tunnel traffic |
+| `ARK_PORT` | `8765` | Listen port |
+| `ARK_HTTP_PATH` | `/mcp` | Endpoint path (`/sse` when `ARK_TRANSPORT=sse`) |
+| `ARK_MCP_TOKEN` | *(required for http)* | Bearer token every request must present |
+
+```bash
+ARK_API_KEY=ark-... \
+ARK_TRANSPORT=http ARK_HOST=0.0.0.0 ARK_PORT=8765 \
+ARK_MCP_TOKEN=$(openssl rand -hex 24) \
+python server.py
+```
+
+Requests must carry the token either as a header (`Authorization: Bearer <token>`)
+or as a query parameter (`/mcp?token=<token>`) — the latter exists because some
+mobile clients (Chatbox) only offer a URL field. Anything else gets `401`. The
+server **refuses to start** in HTTP mode without a token, because an open
+endpoint lets anyone spend your Ark credits.
+
+Client side (Chatbox and similar): choose the remote/streamable-HTTP transport,
+set the URL to `https://<your-host>/mcp`, and add a header
+`Authorization=Bearer <token>` if the client offers an HTTP-header field
+(Chatbox's mobile app does). Clients that only accept a URL can use
+`https://<your-host>/mcp?token=<token>` instead; a query token is easier to leak
+into proxy logs, so keep the URL private and always use HTTPS.
+
+Two things behave differently from stdio:
+
+- **Image inputs must be URLs, not local paths.** A path like `F:\photo.jpg`
+  refers to the *server's* filesystem, which the phone cannot see.
+- **Output files land on the server's disk.** Configure `ARK_UPLOAD_PROVIDER`
+  (see above) so results also come back as `share_urls` you can open anywhere.
+
+Expose it over HTTPS before using it from a phone — put it behind a reverse
+proxy, a tunnel (Cloudflare Tunnel, ngrok, Tailscale Funnel), or a cloud VM
+with a TLS-terminating proxy. Plain HTTP over the public internet leaks the
+token and the images.
+
+### Showing images in the chat
+
+Many MCP clients do **not** render native `image` content blocks. Chatbox is one
+of them: it prints the raw base64 into the conversation, which both hides the
+picture and burns tens of thousands of tokens.
+
+Use `ark_show_image` with its default `mode="markdown"` instead. It re-encodes
+the picture, uploads it via the configured image host, and returns a line like
+`![image](https://...)`; repeat that line in your reply and any Markdown-based UI
+renders the picture inline. `mode="block"` exists for clients that genuinely
+render MCP images — do not use it with Chatbox.
+
+### Cloudflare Tunnel (worked example)
+
+Prerequisites: a domain whose nameservers point at Cloudflare, and `cloudflared`.
+
+```bash
+cloudflared tunnel login
+cloudflared tunnel create ark-image
+cloudflared tunnel route dns ark-image mcp.example.com
+```
+
+`~/.cloudflared/config.yml`:
+
+```yaml
+tunnel: <tunnel-id-from-create>
+credentials-file: /path/to/<tunnel-id>.json
+ingress:
+  - hostname: mcp.example.com
+    service: http://127.0.0.1:8765
+  - service: http_status:404
+```
+
+```bash
+cloudflared tunnel run ark-image
+```
+
+`run-public.bat` (Windows) does steps 2–3 of the launch for you: it loads
+`.env.http`, starts the Python server, then runs the tunnel. Machine-specific
+paths (`CLOUDFLARED_BIN`, `TUNNEL_CONFIG`, `TUNNEL_NAME`) are read from
+`.env.http` so the script itself stays portable. Note the tunnel is an outbound
+connection from your machine — the service disappears when the machine sleeps.
+
+
 ## Client setup (works in ZCode, OpenCode, Codex)
 
 Because this is a standard stdio MCP server, it plugs into any MCP-compatible client.

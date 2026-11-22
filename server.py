@@ -4,7 +4,9 @@ import json
 import logging
 import os
 import re
+import tempfile
 import time
+import urllib.parse
 import uuid
 from typing import Optional
 
@@ -14,6 +16,18 @@ import requests
 from mcp.server.fastmcp import FastMCP
 
 from uploader import describe_config, upload_paths
+
+# Transport settings. stdio is the default so existing desktop clients (ZCode,
+# Claude Desktop, ...) keep working unchanged; set ARK_TRANSPORT=http to serve
+# over streamable HTTP for remote clients such as Chatbox on a phone.
+# These are read before FastMCP is constructed because host/port are ctor args.
+ARK_TRANSPORT = os.environ.get("ARK_TRANSPORT", "stdio").strip().lower()
+ARK_HOST = os.environ.get("ARK_HOST", "127.0.0.1").strip()
+ARK_PORT = int(os.environ.get("ARK_PORT", "8765"))
+ARK_HTTP_PATH = os.environ.get("ARK_HTTP_PATH", "/mcp").strip() or "/mcp"
+# Bearer token required by the HTTP transport. Without it the server refuses to
+# start in http mode: an open endpoint would let anyone spend your Ark credits.
+ARK_MCP_TOKEN = os.environ.get("ARK_MCP_TOKEN", "").strip()
 
 mcp = FastMCP(
     "ark-image-gen",
@@ -49,11 +63,28 @@ mcp = FastMCP(
         "- If image hosting is configured, the report also carries share_urls (public links) and a "
         "hosting block. Surface share_urls verbatim when the user needs to view an image from another "
         "device or chat app, since local file paths do not open on a phone.\n"
+        "- SHOWING AN IMAGE: always prefer MARKDOWN over MCP image blocks. Call "
+        "ark_show_image(image=<local path from a previous result>) with mode left at its default "
+        "'markdown', then repeat the returned `markdown` field verbatim in your reply — that is what "
+        "makes the picture render inside the chat. Do this by default whenever you generate or edit "
+        "an image, without waiting to be asked. \n"
+        "  * NEVER use mode='block' unless the user explicitly says their client renders MCP images. "
+        "Chatbox (including the mobile app) does not: it prints the raw base64 into the conversation, "
+        "which costs tens of thousands of tokens and shows no picture.\n"
+        "  * If ark_show_image returns an error (e.g. no image host configured), fall back to giving "
+        "the share_urls link as plain text.\n"
         "- ALL tools return a JSON object: {\"ok\": true/false, ...}. On success the object carries the "
         "result fields (files, usage, notes, refined_prompt, ...); on failure it carries "
         "{\"ok\": false, \"error_type\": \"config|invalid_argument|load|api\", \"error\": \"message\"}. "
         "ark_scene_profile on success returns {\"ok\": true, \"profile\": \"...\", \"images\": N}."
     ),
+    # HTTP transport settings; ignored in stdio mode. stateless_http keeps the
+    # server usable behind a plain load balancer / tunnel without session
+    # affinity, which is what a phone client needs.
+    host=ARK_HOST,
+    port=ARK_PORT,
+    streamable_http_path=ARK_HTTP_PATH,
+    stateless_http=ARK_TRANSPORT in ("http", "streamable-http"),
 )
 
 logger = logging.getLogger("ark-image-gen")
@@ -624,6 +655,121 @@ def ark_locate_object(
     if bbox is None:
         return _ok(found=False, bbox=None, raw=(raw or "").strip()[:100])
     return _ok(found=True, bbox=bbox, raw=None)
+
+
+# ---------- 展示层：让图片在聊天界面里直接显示 ----------
+
+def _to_display_jpeg(img_data: bytes, max_dim: int = 1024, quality: int = 82) -> bytes:
+    """Re-encode as a chat-sized JPEG."""
+    if not HAS_PIL:
+        return img_data
+    img = PILImage.open(io.BytesIO(img_data))
+    img = ImageOps.exif_transpose(img)
+    if img.mode not in ("RGB", "L"):
+        img = img.convert("RGB")
+    img.thumbnail((max_dim, max_dim), PILImage.LANCZOS)
+    buf = io.BytesIO()
+    img.save(buf, format="JPEG", quality=quality)
+    return buf.getvalue()
+
+
+@mcp.tool()
+def ark_show_image(image: str, max_dim: int = 1024, mode: str = "markdown"):
+    """Make a generated image visible in the chat.
+
+    `mode="markdown"` (default) returns a Markdown image line plus the public URL.
+    Repeat that line verbatim in your reply and the chat client renders the
+    picture inline — this works in Chatbox, Cursor, Claude, and most other
+    Markdown-based UIs.
+
+    `mode="block"` returns a native MCP `image` content block instead. Only use
+    it for clients known to render MCP images; clients that do not (Chatbox is
+    one) will dump the raw base64 into the conversation as text.
+
+    Args:
+        image: Local path on the server, or an http(s) URL.
+        max_dim: Longest side in pixels for the copy that gets uploaded.
+        mode: "markdown" (default) or "block".
+    """
+    from mcp.types import ImageContent, TextContent
+
+    max_dim = max(256, min(int(max_dim or 1024), 2048))
+    mode = (mode or "markdown").strip().lower()
+    if mode not in ("markdown", "block"):
+        return _err("invalid_argument", "mode must be 'markdown' or 'block'")
+
+    if mode == "markdown":
+        # A URL input can be linked directly; only local files need hosting.
+        if image.startswith(("http://", "https://")):
+            markdown = f"![image]({image})"
+            return _ok(markdown=markdown, url=image, source=image[:200],
+                       note="Repeat the markdown field verbatim in your reply.")
+
+        try:
+            data, label = load_input_image(image)
+        except Exception as e:
+            return _err("load", f"failed to load image: {e}")
+
+        hosting = describe_config()
+        if not hosting["enabled"]:
+            return _err("config",
+                        "no image host configured, so no public URL is available to "
+                        "embed. Set ARK_UPLOAD_PROVIDER (e.g. aliyun) or pass an http(s) "
+                        f"URL. The local file is still at: {label[:200]}")
+
+        try:
+            payload = _to_display_jpeg(data, max_dim=max_dim)
+        except Exception as e:
+            return _err("load", f"failed to re-encode image: {e}")
+
+        tmpdir = tempfile.mkdtemp(prefix="ark_show_")
+        tmp_path = os.path.join(tmpdir, "show.jpg")
+        try:
+            with open(tmp_path, "wb") as fh:
+                fh.write(payload)
+            notes = []
+            urls, notes = upload_paths([tmp_path], notes)
+        finally:
+            try:
+                os.remove(tmp_path)
+                os.rmdir(tmpdir)
+            except OSError:
+                pass
+
+        if not urls:
+            return _err("api", "upload failed: " + ("; ".join(notes) if notes else "no URL returned"))
+
+        markdown = f"![image]({urls[0]})"
+        return _ok(markdown=markdown, url=urls[0], source=label[:200],
+                   bytes=len(payload),
+                   note="Repeat the markdown field verbatim in your reply so the "
+                        "client renders the picture.")
+
+    # mode == "block"
+    try:
+        data, label = load_input_image(image)
+    except Exception as e:
+        return _err("load", f"failed to load image: {e}")
+
+    try:
+        payload = _to_display_jpeg(data, max_dim=max_dim)
+    except Exception as e:
+        return _err("load", f"failed to re-encode image: {e}")
+
+    summary = {
+        "ok": True,
+        "source": label[:200],
+        "mime": "image/jpeg",
+        "bytes": len(payload),
+        "inline": True,
+        "note": "Image returned as an inline image block; clients without image "
+                "rendering will only show this summary.",
+    }
+    return [
+        TextContent(type="text", text=json.dumps(summary, ensure_ascii=False)),
+        ImageContent(type="image", data=base64.b64encode(payload).decode(),
+                     mimeType="image/jpeg"),
+    ]
 
 
 # ---------- 空间操作层：region/mask 编辑 ----------
@@ -1404,8 +1550,74 @@ def ark_generate_identity_templates(
                output_dir=output_dir, templates=templates, total=len(templates))
 
 
+class _BearerAuthMiddleware:
+    """Reject HTTP requests that do not carry the configured token.
+
+    Accepts the token two ways because client support varies:
+      * ``Authorization: Bearer <token>`` header (MCP Inspector, curl, Claude);
+      * ``?token=<token>`` query parameter, for clients whose remote-MCP UI only
+        offers a URL field (Chatbox on mobile is one of them).
+
+    FastMCP's built-in auth support is OAuth-server oriented, which is heavy for
+    a single-user server; a static token covers this use case.
+    """
+
+    def __init__(self, app, token: str) -> None:
+        self.app = app
+        self.token = token
+
+    async def __call__(self, scope, receive, send):
+        if scope["type"] != "http":
+            return await self.app(scope, receive, send)
+
+        headers = {k.lower(): v for k, v in (scope.get("headers") or [])}
+        raw = headers.get(b"authorization", b"")
+        supplied = raw.decode("latin-1") if isinstance(raw, (bytes, bytearray)) else str(raw)
+
+        authorized = supplied == f"Bearer {self.token}"
+        if not authorized and self.token:
+            query = scope.get("query_string", b"")
+            if isinstance(query, (bytes, bytearray)):
+                query = query.decode("latin-1")
+            params = urllib.parse.parse_qs(str(query))
+            authorized = self.token in params.get("token", [])
+
+        if not authorized:
+            await send({
+                "type": "http.response.start",
+                "status": 401,
+                "headers": [(b"content-type", b"application/json"),
+                            (b"www-authenticate", b"Bearer")],
+            })
+            await send({"type": "http.response.body",
+                        "body": b'{"error":"unauthorized"}'})
+            return
+        await self.app(scope, receive, send)
+
+
 def main() -> None:
-    mcp.run()
+    if ARK_TRANSPORT == "stdio":
+        mcp.run()
+        return
+
+    if ARK_TRANSPORT not in ("http", "streamable-http", "sse"):
+        raise SystemExit(
+            f"unsupported ARK_TRANSPORT '{ARK_TRANSPORT}' (expected stdio|http|sse)"
+        )
+    if not ARK_MCP_TOKEN:
+        raise SystemExit(
+            "ARK_MCP_TOKEN is required when serving over HTTP: an unauthenticated "
+            "endpoint would let anyone spend your Ark credits."
+        )
+
+    import uvicorn
+
+    path = "/sse" if ARK_TRANSPORT == "sse" else ARK_HTTP_PATH
+    app = mcp.sse_app() if ARK_TRANSPORT == "sse" else mcp.streamable_http_app()
+    logger.info("Serving MCP over %s at http://%s:%s%s (bearer auth required)",
+                ARK_TRANSPORT, ARK_HOST, ARK_PORT, path)
+    uvicorn.run(_BearerAuthMiddleware(app, ARK_MCP_TOKEN),
+                host=ARK_HOST, port=ARK_PORT, log_level="info")
 
 
 if __name__ == "__main__":
