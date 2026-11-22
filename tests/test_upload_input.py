@@ -82,7 +82,9 @@ def test_instructions_lead_with_the_upload_workflow(monkeypatch):
     assert "READ THIS FIRST" in text
     lead = text[: text.index("READ THIS FIRST")]
     assert "ark_scene_profile" not in lead  # tools listing comes after the warning
-    assert "/upload" in text[:1400]
+    warning_block = text[text.index("READ THIS FIRST"):]
+    assert "ark_upload_image" in warning_block[:2000]
+    assert "/upload" in warning_block[:2000]
 
 
 # ---------- ark_upload_image (bytes over the MCP connection) ----------
@@ -138,6 +140,100 @@ def test_mcp_upload_sanitizes_filename(tmp_path, monkeypatch):
 
 def test_instructions_mention_the_upload_tool():
     assert "ark_upload_image" in server.mcp.instructions
+
+
+# ---------- chunked upload ----------
+
+def _b64_slices(raw: bytes, n: int):
+    """Split base64 at 4-char boundaries, the way the instructions tell a model to."""
+    b64 = base64.b64encode(raw).decode()
+    step = (len(b64) // n) // 4 * 4 or 4
+    return [b64[i:i + step] for i in range(0, len(b64), step)]
+
+
+def test_chunked_upload_assembles_correctly(tmp_path, monkeypatch):
+    monkeypatch.setattr(server, "ARK_INPUT_DIR", str(tmp_path))
+    server._PENDING_UPLOADS.clear()
+    raw = _jpeg_bytes((320, 240))
+    slices = _b64_slices(raw, 3)
+
+    for i, chunk in enumerate(slices):
+        out = server.ark_upload_image(chunk, filename="big.jpg",
+                                      upload_id="u1", index=i, total=len(slices))
+        if i < len(slices) - 1:
+            assert out["ok"] is True
+            assert out["pending"] is True
+            assert out["received"] == i + 1
+
+    assert out["ok"] is True
+    assert out.get("pending") is None
+    assert open(out["path"], "rb").read() == raw
+    assert "u1" not in server._PENDING_UPLOADS  # cleaned up
+
+
+def test_chunked_upload_returns_next_index(tmp_path, monkeypatch):
+    monkeypatch.setattr(server, "ARK_INPUT_DIR", str(tmp_path))
+    server._PENDING_UPLOADS.clear()
+    slices = _b64_slices(_jpeg_bytes(), 4)
+    out = server.ark_upload_image(slices[0], upload_id="u2", index=0, total=len(slices))
+    assert out["next_index"] == 1
+
+
+def test_chunked_upload_can_arrive_out_of_order(tmp_path, monkeypatch):
+    monkeypatch.setattr(server, "ARK_INPUT_DIR", str(tmp_path))
+    server._PENDING_UPLOADS.clear()
+    raw = _jpeg_bytes((200, 150))
+    slices = _b64_slices(raw, 3)
+    order = list(reversed(range(len(slices))))
+    for pos, i in enumerate(order):
+        out = server.ark_upload_image(slices[i], upload_id="u3", index=i, total=len(slices))
+        if pos == len(order) - 1:
+            assert out["ok"] is True
+            assert open(out["path"], "rb").read() == raw
+
+
+def test_chunked_upload_requires_upload_id():
+    out = server.ark_upload_image("AAAA", index=0, total=2)
+    assert out["ok"] is False
+    assert "upload_id is required" in out["error"]
+
+
+def test_chunked_upload_rejects_total_mismatch(tmp_path, monkeypatch):
+    monkeypatch.setattr(server, "ARK_INPUT_DIR", str(tmp_path))
+    server._PENDING_UPLOADS.clear()
+    server.ark_upload_image("AAAA", upload_id="u4", index=0, total=2)
+    out = server.ark_upload_image("BBBB", upload_id="u4", index=1, total=3)
+    assert out["ok"] is False
+    assert "total=2" in out["error"]
+
+
+def test_chunked_upload_rejects_index_out_of_range():
+    out = server.ark_upload_image("AAAA", upload_id="u5", index=5, total=3)
+    assert out["ok"] is False
+    assert "out of range" in out["error"]
+
+
+def test_chunked_upload_rejects_empty_slice():
+    out = server.ark_upload_image("   ", upload_id="u6", index=0, total=2)
+    assert out["ok"] is False
+    assert "empty" in out["error"]
+
+
+def test_pending_uploads_are_swept(tmp_path, monkeypatch):
+    monkeypatch.setattr(server, "ARK_INPUT_DIR", str(tmp_path))
+    server._PENDING_UPLOADS.clear()
+    server.ark_upload_image("AAAA", upload_id="stale", index=0, total=2)
+    server._PENDING_UPLOADS["stale"]["updated"] -= server._PENDING_TTL + 1
+    server._sweep_pending()
+    assert "stale" not in server._PENDING_UPLOADS
+
+
+def test_pending_uploads_are_bounded(tmp_path, monkeypatch):
+    monkeypatch.setattr(server, "ARK_INPUT_DIR", str(tmp_path))
+    server._PENDING_UPLOADS.clear()
+    for i in range(server._PENDING_MAX + 5):
+        server.ark_upload_image("AAAA", upload_id=f"many{i}", index=0, total=2)
+    assert len(server._PENDING_UPLOADS) <= server._PENDING_MAX
 
 
 

@@ -70,9 +70,14 @@ mcp = FastMCP(
         "  1. If your client can give you a PUBLIC http(s) URL for that image (a download link that "
         "opens in a normal browser), pass that URL as the `image` argument. Zero extra cost — try "
         "this first if such a link is available.\n"
-        "  2. Otherwise call ark_upload_image(data=<base64 of the file>, filename='<name>') and pass "
-        "the returned `path` as `image`. This travels over the MCP connection, so it still works "
-        "when your sandbox has no shell networking. This is the normal path on mobile clients.\n"
+        "  2. Otherwise call ark_upload_image and pass the returned `path` as `image`. This travels over "
+        "the MCP connection, so it still works when your sandbox has no shell networking. This is the "
+        "normal path on mobile clients.\n"
+        "     * If the base64 is too big to emit in ONE tool call (roughly >20 KB of base64, which is "
+        "any normal photo), SLICE IT: call ark_upload_image repeatedly with the same upload_id, "
+        "incrementing index, and total=N. Split the base64 STRING on a multiple-of-4 boundary and keep "
+        "the slices in order. Each reply is {\"ok\":true,\"pending\":true,\"received\":n}; the last one "
+        "returns the path. Do not give up because a single call is too large — chunking is expected.\n"
         "  3. Only if you have a shell WITH internet access, curl the bytes: <UPLOAD_COMMAND>\n"
         "Do NOT paste a large base64 blob straight into ark_edit_image's arguments: use "
         "ark_upload_image once and reuse the short path. If the file is large, downscale it in your "
@@ -80,6 +85,16 @@ mcp = FastMCP(
         "an order of magnitude and does not hurt editing quality.\n"
         "ark_upload_image returns {\"ok\": true, \"path\": ...}; if it fails, report the error to the "
         "user instead of retrying other transports.\n\n"
+        "*** SLOW CALLS AND PROXY TIMEOUTS ***\n"
+        "A proxied MCP connection is cut after roughly 100 seconds of silence, while editing "
+        "(vision rewrite + generation) routinely needs 2-3 minutes. So for ark_edit_image, "
+        "ark_revise_image, ark_portrait_from_ref and ark_generate_identity_templates, prefer:\n"
+        "    ark_start_job(tool='ark_edit_image', arguments='{\"intent\":..., \"image\":...}')\n"
+        "  -> returns {\"job_id\": ...} immediately; then call ark_job_status(job_id, wait_seconds=40) "
+        "and repeat until status is 'ok' or 'error'. The `result` field is the tool's normal output. "
+        "ark_generate_image alone is usually fast enough to call directly.\n"
+        "If a direct call fails with a connection error or 524, that is this timeout, not a real "
+        "failure — retry the same work through ark_start_job instead of telling the user it broke.\n\n"
         "Two models power this server (handled internally):\n"
         "- Seedream 5.0 pro: generates/edits images (image-to-image).\n"
         "- Doubao Seed 2.1 pro (vision): reads reference images and rewrites edit intent into detailed "
@@ -800,39 +815,19 @@ def _to_display_jpeg(img_data: bytes, max_dim: int = 1024, quality: int = 82) ->
 
 
 @mcp.tool()
-def ark_upload_image(data: str, filename: str = "") -> dict:
-    """Store an image that exists only on the client, so the other tools can use it.
-
-    Remote clients often cannot reach this server's /upload endpoint: a mobile
-    sandbox typically has no shell networking even though MCP tool calls work
-    fine. This tool carries the bytes over the MCP connection itself, which is
-    the only channel that reliably exists on both sides.
-
-    Prefer this over inlining base64 into an editing tool's arguments: the
-    payload is sent once, and you get back a short path to reuse.
-
-    Args:
-        data: base64 image bytes. A full `data:image/jpeg;base64,...` URL, a
-              `b64:` prefix, or bare base64 are all accepted; whitespace and
-              newlines are ignored.
-        filename: optional name hint, used only to choose a friendlier stem.
-
-    Returns {"ok": true, "path": "<absolute path on this server>", "bytes": N}.
-    Pass that `path` as the `image` argument of any other tool here.
-    """
-    raw = (data or "").strip()
+def _decode_image_payload(raw: str) -> bytes:
+    """Decode a data: URL, b64: payload, or bare base64 (whitespace tolerated)."""
+    raw = (raw or "").strip()
     if not raw:
-        return _err("invalid_argument", "data is empty; pass base64 image bytes")
+        raise ValueError("payload is empty")
+    if raw.startswith(("data:", "b64:")):
+        img_data, _ = load_input_image(raw)
+        return img_data
+    return base64.b64decode(re.sub(r"\s+", "", raw), validate=False)
 
-    try:
-        if raw.startswith(("data:", "b64:")):
-            img_data, _ = load_input_image(raw)
-        else:
-            cleaned = re.sub(r"\s+", "", raw)
-            img_data = base64.b64decode(cleaned, validate=False)
-    except Exception as e:
-        return _err("invalid_argument", f"could not decode base64 payload: {e}")
 
+def _store_image_bytes(img_data: bytes, filename: str) -> dict:
+    """Validate image bytes, write them under the input dir, return the report."""
     if not img_data:
         return _err("invalid_argument", "payload decoded to 0 bytes")
 
@@ -864,6 +859,245 @@ def ark_upload_image(data: str, filename: str = "") -> dict:
 
     logger.info("Received MCP upload: %s (%d bytes)", name, len(img_data))
     return _ok(path=path, bytes=len(img_data), filename=name)
+
+
+# In-flight chunked uploads: upload_id -> {"chunks": {index: str}, "total": n,
+# "filename": str, "updated": epoch}. Bounded below so a client that abandons an
+# upload cannot grow this forever.
+_PENDING_UPLOADS: dict = {}
+_PENDING_TTL = 1800  # seconds
+_PENDING_MAX = 32
+
+
+def _sweep_pending(now: Optional[float] = None) -> None:
+    now = time.time() if now is None else now
+    for key, entry in list(_PENDING_UPLOADS.items()):
+        if now - entry["updated"] > _PENDING_TTL:
+            _PENDING_UPLOADS.pop(key, None)
+    while len(_PENDING_UPLOADS) > _PENDING_MAX:
+        oldest = min(_PENDING_UPLOADS, key=lambda k: _PENDING_UPLOADS[k]["updated"])
+        _PENDING_UPLOADS.pop(oldest, None)
+
+
+@mcp.tool()
+def ark_upload_image(data: str, filename: str = "", upload_id: str = "",
+                     index: int = 0, total: int = 1) -> dict:
+    """Store an image that exists only on the client, so the other tools can use it.
+
+    Remote clients often cannot reach this server's /upload endpoint: a mobile
+    sandbox typically has no shell networking even though MCP tool calls work
+    fine. This tool carries the bytes over the MCP connection itself, which is
+    the only channel that reliably exists on both sides.
+
+    CHUNKED MODE — use this when the image is too large to emit in one call.
+    A single tool call cannot carry more than roughly 20-30 KB of base64 on most
+    clients, so for a big photo send the SAME base64 string in slices:
+
+        ark_upload_image(data=<slice 0>, upload_id="photo1", index=0, total=3)
+        ark_upload_image(data=<slice 1>, upload_id="photo1", index=1, total=3)
+        ark_upload_image(data=<slice 2>, upload_id="photo1", index=2, total=3)
+
+    Rules for slicing: split the base64 string (not the raw bytes) at a multiple
+    of 4 characters, keep the slices in order, and do not reformat them. Each
+    intermediate reply is {"ok": true, "pending": true, "received": n, "total": N};
+    the final one returns the usual {"ok": true, "path": ...}. Pick any unique
+    upload_id you like and reuse it for every slice.
+
+    Args:
+        data: base64 image bytes. A full `data:image/jpeg;base64,...` URL, a
+              `b64:` prefix, or bare base64 are all accepted; whitespace and
+              newlines are ignored. In chunked mode this is ONE slice.
+        filename: optional name hint, used only to choose a friendlier stem.
+        upload_id: required when total > 1; groups the slices together.
+        index: zero-based slice number.
+        total: number of slices; 1 (default) means a single complete payload.
+
+    Returns {"ok": true, "path": "<absolute path on this server>", "bytes": N}.
+    Pass that `path` as the `image` argument of any other tool here.
+    """
+    try:
+        total = max(1, int(total or 1))
+        index = max(0, int(index or 0))
+    except (TypeError, ValueError):
+        return _err("invalid_argument", "index and total must be integers")
+
+    # ---- single-shot ----
+    if total == 1:
+        try:
+            img_data = _decode_image_payload(data)
+        except Exception as e:
+            return _err("invalid_argument", f"could not decode base64 payload: {e}")
+        return _store_image_bytes(img_data, filename)
+
+    # ---- chunked ----
+    if not upload_id.strip():
+        return _err("invalid_argument",
+                    "upload_id is required when total > 1; pick a unique id and reuse "
+                    "it for every slice of this image")
+    if index >= total:
+        return _err("invalid_argument", f"index {index} is out of range for total {total}")
+
+    _sweep_pending()
+    entry = _PENDING_UPLOADS.setdefault(
+        upload_id.strip(),
+        {"chunks": {}, "total": total, "filename": filename, "updated": time.time()},
+    )
+    _sweep_pending()  # the insertion above may have pushed past the cap
+    if entry["total"] != total:
+        return _err("invalid_argument",
+                    f"upload_id {upload_id!r} was started with total={entry['total']}, "
+                    f"got total={total}")
+    if filename:
+        entry["filename"] = filename
+
+    slice_data = re.sub(r"\s+", "", data or "")
+    if not slice_data:
+        return _err("invalid_argument", f"slice {index} is empty")
+    entry["chunks"][index] = slice_data
+    entry["updated"] = time.time()
+
+    received = len(entry["chunks"])
+    if received < total:
+        return _ok(pending=True, upload_id=upload_id.strip(), received=received,
+                   total=total, next_index=sorted(set(range(total)) - set(entry["chunks"]))[0],
+                   hint=f"Send the remaining slices with the same upload_id; "
+                        f"{total - received} left.")
+
+    missing = sorted(set(range(total)) - set(entry["chunks"]))
+    if missing:
+        return _err("invalid_argument", f"missing slices: {missing}")
+
+    joined = "".join(entry["chunks"][i] for i in range(total))
+    _PENDING_UPLOADS.pop(upload_id.strip(), None)
+    try:
+        img_data = base64.b64decode(joined, validate=False)
+    except Exception as e:
+        return _err("invalid_argument", f"assembled payload does not decode: {e}")
+    return _store_image_bytes(img_data, entry["filename"] or filename)
+
+
+# ---------- background jobs (for calls that outlive a proxy timeout) ----------
+
+# Tool name -> callable. Editing goes through a vision rewrite plus a generation
+# call, which together can exceed the ~100 s a proxied request is allowed to
+# stay silent (Cloudflare's free-plan proxy read timeout, not adjustable).
+_JOBS: dict = {}
+_JOB_TTL = 3600
+_JOB_MAX = 32
+_SLOW_TOOLS = {
+    "ark_generate_image",
+    "ark_edit_image",
+    "ark_revise_image",
+    "ark_portrait_from_ref",
+    "ark_generate_identity_templates",
+    "ark_scene_profile",
+}
+
+
+def _sweep_jobs(now: Optional[float] = None) -> None:
+    now = time.time() if now is None else now
+    for key, job in list(_JOBS.items()):
+        if job["done"] and now - job["updated"] > _JOB_TTL:
+            _JOBS.pop(key, None)
+    while len(_JOBS) > _JOB_MAX:
+        oldest = min(_JOBS, key=lambda k: _JOBS[k]["updated"])
+        _JOBS.pop(oldest, None)
+
+
+@mcp.tool()
+def ark_start_job(tool: str, arguments: str = "{}") -> dict:
+    """Run a slow tool in the background and return a job id immediately.
+
+    Use this when the call may take longer than ~90 seconds — image editing and
+    revision run a vision rewrite plus a generation pass, and a proxied HTTP
+    connection is often cut before they finish. Submitting returns at once, so
+    the transport never goes quiet; then poll ark_job_status until it is done.
+
+    Args:
+        tool: name of the slow tool to run, e.g. "ark_edit_image".
+        arguments: JSON object string of that tool's arguments, e.g.
+                   '{"intent": "...", "image": "C:/.../in.jpg", "size": "1K"}'.
+
+    Returns {"ok": true, "job_id": "...", "tool": "...", "status": "running"}.
+    """
+    import threading
+
+    name = (tool or "").strip()
+    if name not in _SLOW_TOOLS:
+        return _err("invalid_argument",
+                    f"{name!r} is not a background-capable tool; "
+                    f"expected one of {sorted(_SLOW_TOOLS)}")
+    fn = globals().get(name)
+    if not callable(fn):
+        return _err("config", f"tool {name!r} is not available in this build")
+
+    try:
+        kwargs = json.loads(arguments) if arguments.strip() else {}
+    except json.JSONDecodeError as e:
+        return _err("invalid_argument", f"arguments is not valid JSON: {e}")
+    if not isinstance(kwargs, dict):
+        return _err("invalid_argument", "arguments must be a JSON object")
+
+    _sweep_jobs()
+    job_id = uuid.uuid4().hex[:16]
+    job = {"id": job_id, "tool": name, "status": "running", "done": False,
+           "result": None, "error": None, "started": time.time(), "updated": time.time()}
+    _JOBS[job_id] = job
+
+    def _run():
+        try:
+            job["result"] = fn(**kwargs)
+            job["status"] = "ok"
+        except Exception as exc:  # surface the failure instead of losing the thread
+            logger.exception("Background job %s (%s) failed", job_id, name)
+            job["error"] = f"{type(exc).__name__}: {exc}"
+            job["status"] = "error"
+        finally:
+            job["done"] = True
+            job["updated"] = time.time()
+
+    threading.Thread(target=_run, name=f"ark-job-{job_id}", daemon=True).start()
+    logger.info("Started background job %s for %s", job_id, name)
+    return _ok(job_id=job_id, tool=name, status="running",
+               hint="Poll ark_job_status(job_id) every few seconds until status is "
+                    "'ok' or 'error'. Keep each poll fast.")
+
+
+@mcp.tool()
+def ark_job_status(job_id: str, wait_seconds: int = 0) -> dict:
+    """Check a background job started with ark_start_job.
+
+    Args:
+        job_id: the id returned by ark_start_job.
+        wait_seconds: how long to block waiting for completion (0-60). Raising it
+                      to ~40 means fewer round trips; keep it well under the
+                      proxy's timeout.
+
+    Returns {"ok": true, "status": "running"|"ok"|"error", "result": {...}}.
+    The `result` field is exactly what the underlying tool would have returned.
+    """
+    job = _JOBS.get((job_id or "").strip())
+    if job is None:
+        return _err("invalid_argument",
+                    f"unknown job_id {job_id!r}; it may have expired "
+                    f"({_JOB_TTL}s after completion)")
+
+    wait = max(0, min(int(wait_seconds or 0), 60))
+    deadline = time.time() + wait
+    while not job["done"] and time.time() < deadline:
+        time.sleep(0.25)
+
+    if not job["done"]:
+        return _ok(job_id=job_id, status="running", tool=job["tool"],
+                   elapsed=round(time.time() - job["started"], 1),
+                   hint="Not finished yet; poll again.")
+
+    _sweep_jobs()
+    if job["status"] == "ok":
+        return _ok(job_id=job_id, status="ok", tool=job["tool"], result=job["result"],
+                   elapsed=round(job["updated"] - job["started"], 1))
+    return _ok(job_id=job_id, status="error", tool=job["tool"], error=job["error"],
+               elapsed=round(job["updated"] - job["started"], 1))
 
 
 @mcp.tool()

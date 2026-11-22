@@ -187,6 +187,31 @@ Options, in the order the instructions tell a model to try them:
 Relative paths are rejected with a message listing these options rather than
 failing deep inside an HTTP client.
 
+### Long calls behind a proxy
+
+A proxied MCP connection is cut after ~100 seconds of silence (Cloudflare's
+free-plan proxy read timeout; not adjustable below Enterprise). That matters
+because `ark_edit_image` runs a vision rewrite **and** a generation pass — 2-3
+minutes, measured. A direct call dies with a 524 while the server is still
+working.
+
+`ark_start_job` / `ark_job_status` move the work off the request path:
+
+```text
+ark_start_job(tool="ark_edit_image",
+              arguments='{"intent": "...", "image": "C:/.../in.jpg", "size": "1K"}')
+  -> {"ok": true, "job_id": "b3d01b45201c4f4e", "status": "running"}
+
+ark_job_status(job_id="b3d01b45201c4f4e", wait_seconds=40)
+  -> {"ok": true, "status": "running", "elapsed": 41.0}      # repeat
+  -> {"ok": true, "status": "ok", "result": {...}}           # tool's normal output
+```
+
+`wait_seconds` is capped at 60 so a single poll cannot itself hit the timeout.
+Finished jobs are kept for an hour (bounded to 32) so a client can still read
+the result after a hiccup. `ark_generate_image` alone is usually fast enough to
+call directly.
+
 Expose it over HTTPS before using it from a phone — put it behind a reverse
 proxy, a tunnel (Cloudflare Tunnel, ngrok, Tailscale Funnel), or a cloud VM
 with a TLS-terminating proxy. Plain HTTP over the public internet leaks the
