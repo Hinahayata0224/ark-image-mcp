@@ -28,6 +28,18 @@ ARK_HTTP_PATH = os.environ.get("ARK_HTTP_PATH", "/mcp").strip() or "/mcp"
 # Bearer token required by the HTTP transport. Without it the server refuses to
 # start in http mode: an open endpoint would let anyone spend your Ark credits.
 ARK_MCP_TOKEN = os.environ.get("ARK_MCP_TOKEN", "").strip()
+# Where images pushed to POST /upload are written. Defaults to a temp dir.
+ARK_INPUT_DIR = os.environ.get("ARK_INPUT_DIR", "").strip()
+# Public base URL of this server, used only to word instructions for remote
+# clients (e.g. https://mcp.example.com). Optional.
+ARK_PUBLIC_BASE_URL = os.environ.get("ARK_PUBLIC_BASE_URL", "").strip().rstrip("/")
+# Hard cap for /upload bodies.
+ARK_MAX_UPLOAD_MB = int(os.environ.get("ARK_MAX_UPLOAD_MB", "25"))
+# Separate credential for POST /upload, so remote clients (whose model cannot
+# see the MCP session's headers) can be told a token without handing over the
+# main one. Its blast radius is limited to writing image files into a temp dir;
+# it cannot call tools or spend Ark credits. Falls back to ARK_MCP_TOKEN.
+ARK_UPLOAD_TOKEN = os.environ.get("ARK_UPLOAD_TOKEN", "").strip()
 
 mcp = FastMCP(
     "ark-image-gen",
@@ -55,8 +67,20 @@ mcp = FastMCP(
         "KEY CONSTRAINTS:\n"
         "- size: square presets '1K'/'2K'/'4K' or 'WIDTHxHEIGHT' (each side 512-4096, area >= 921600 px). "
         "Portrait photos are common in this workspace: use e.g. '1024x1536'.\n"
-        "- image inputs: local path or URL; comma-separate multiple (mainly for ark_scene_profile). "
+        "- image inputs: local path, http(s) URL, `data:<mime>;base64,<payload>`, or a `b64:<payload>` "
+        "string; comma-separate multiple (mainly for ark_scene_profile). "
         "Images with EXIF rotation are auto-corrected; images >= 5000px are auto-downscaled.\n"
+        "- IMAGES THAT ONLY EXIST ON THE CLIENT: when this server runs on a different machine than "
+        "the client, a file the client can see (a photo the user attached in a phone app, a file in "
+        "a sandbox workspace) is NOT readable here, and relative paths will fail. Push the bytes to "
+        "the server first:\n"
+        "    curl -sS -X POST '<PUBLIC_BASE_URL>/upload' -H 'Authorization: Bearer <upload-token>' "
+        "--data-binary @<local file>\n"
+        "  This upload token only authorizes writing image files to the server; it is not the MCP "
+        "session credential. If the response is 401, the user must supply the upload token.\n"
+        "  The JSON reply contains an absolute `path` on the server — pass that to the editing tools. "
+        "Small images (a few hundred KB) can instead be inlined as a data: or b64: payload. Never "
+        "guesstimate a server path from a client-side relative path.\n"
         "- Output images are saved to the caller's current working directory as ark_img_*.jpg; the report "
         "includes files, usage, notes, and refined_prompt (the actual prompt the vision model wrote - "
         "review it to verify intent fidelity).\n"
@@ -77,6 +101,13 @@ mcp = FastMCP(
         "result fields (files, usage, notes, refined_prompt, ...); on failure it carries "
         "{\"ok\": false, \"error_type\": \"config|invalid_argument|load|api\", \"error\": \"message\"}. "
         "ark_scene_profile on success returns {\"ok\": true, \"profile\": \"...\", \"images\": N}."
+    ).replace(
+        "<PUBLIC_BASE_URL>",
+        ARK_PUBLIC_BASE_URL or (f"http://{ARK_HOST}:{ARK_PORT}" if ARK_HOST != "0.0.0.0"
+                               else "http://<this-server>"),
+    ).replace(
+        "<upload-token>",
+        ARK_UPLOAD_TOKEN or ARK_MCP_TOKEN or "<upload-token>",
     ),
     # HTTP transport settings; ignored in stdio mode. stateless_http keeps the
     # server usable behind a plain load balancer / tunnel without session
@@ -223,16 +254,53 @@ def _save_b64_data(b64_str: str, output_dir: str) -> str:
 
 
 def load_input_image(source: str) -> tuple:
-    """Load an image from a local path or URL. Returns (img_data, source_label)."""
+    """Load an image from a local path, http(s) URL, data: URL, or b64: payload.
+
+    Returns (img_data, source_label).
+
+    The data:/b64: forms exist for REMOTE clients: when this server runs on
+    another machine than the client, a file the client can see is unreachable
+    here. Inlining the bytes is then the only way to pass it along.
+    """
+    s = (source or "").strip()
+    if not s:
+        raise ValueError("empty image source")
+
+    if s.startswith("data:"):
+        m = re.match(r"^data:([^;,]*)(;base64)?,(.*)$", s, re.S)
+        if not m:
+            raise ValueError("malformed data URL (expected data:<mime>;base64,<payload>)")
+        mime, is_b64, payload = m.group(1), m.group(2), m.group(3)
+        data = base64.b64decode(payload, validate=False) if is_b64 \
+            else urllib.parse.unquote_to_bytes(payload)
+        if not data:
+            raise ValueError("data URL decoded to 0 bytes")
+        return data, f"data:{mime or 'image/*'} ({len(data)} bytes)"
+
+    if s.startswith("b64:"):
+        data = base64.b64decode(s[4:], validate=False)
+        if not data:
+            raise ValueError("b64: payload decoded to 0 bytes")
+        return data, f"base64 payload ({len(data)} bytes)"
+
+    # Reject obviously relative paths early with a message the model can act on,
+    # instead of letting requests.get() fail with a confusing URL error.
     try:
-        with open(source, "rb") as f:
+        with open(s, "rb") as f:
             img_data = f.read()
-        return img_data, os.path.abspath(source)
+        return img_data, os.path.abspath(s)
     except OSError:
         pass
-    resp = requests.get(source, headers=UA_HEADERS, timeout=120)
+    if not s.startswith(("http://", "https://")):
+        raise ValueError(
+            f"not a readable local path on this machine and not an http(s) URL: {s!r}. "
+            "For an image that only exists on the client, send its bytes to this "
+            "server's /upload endpoint first (or pass a data:/b64: payload), then use "
+            "the returned path."
+        )
+    resp = requests.get(s, headers=UA_HEADERS, timeout=120)
     resp.raise_for_status()
-    return resp.content, source
+    return resp.content, s
 
 
 def to_base64_data_uri(img_data: bytes) -> str:
@@ -1551,20 +1619,32 @@ def ark_generate_identity_templates(
 
 
 class _BearerAuthMiddleware:
-    """Reject HTTP requests that do not carry the configured token.
+    """Reject HTTP requests that do not carry an acceptable token.
 
-    Accepts the token two ways because client support varies:
+    Tokens are matched per path: /mcp needs ARK_MCP_TOKEN, while /upload accepts
+    ARK_UPLOAD_TOKEN as well (and falls back to the main token when no separate
+    one is configured).
+
+    A token may arrive two ways, because client support varies:
       * ``Authorization: Bearer <token>`` header (MCP Inspector, curl, Claude);
       * ``?token=<token>`` query parameter, for clients whose remote-MCP UI only
-        offers a URL field (Chatbox on mobile is one of them).
+        offers a URL field.
 
     FastMCP's built-in auth support is OAuth-server oriented, which is heavy for
     a single-user server; a static token covers this use case.
     """
 
-    def __init__(self, app, token: str) -> None:
+    def __init__(self, app, token: str, upload_token: str = "") -> None:
         self.app = app
         self.token = token
+        self.upload_token = upload_token
+
+    def _accepted(self, path: str) -> set:
+        accepted = {t for t in (self.token,) if t}
+        if path.rstrip("/") == "/upload":
+            accepted.add(self.upload_token or self.token)
+            accepted.discard("")
+        return accepted
 
     async def __call__(self, scope, receive, send):
         if scope["type"] != "http":
@@ -1573,26 +1653,97 @@ class _BearerAuthMiddleware:
         headers = {k.lower(): v for k, v in (scope.get("headers") or [])}
         raw = headers.get(b"authorization", b"")
         supplied = raw.decode("latin-1") if isinstance(raw, (bytes, bytearray)) else str(raw)
+        bearer = supplied[7:] if supplied.lower().startswith("bearer ") else ""
 
-        authorized = supplied == f"Bearer {self.token}"
-        if not authorized and self.token:
-            query = scope.get("query_string", b"")
-            if isinstance(query, (bytes, bytearray)):
-                query = query.decode("latin-1")
-            params = urllib.parse.parse_qs(str(query))
-            authorized = self.token in params.get("token", [])
+        query = scope.get("query_string", b"")
+        if isinstance(query, (bytes, bytearray)):
+            query = query.decode("latin-1")
+        params = urllib.parse.parse_qs(str(query))
+        query_tokens = set(params.get("token", []))
 
-        if not authorized:
-            await send({
-                "type": "http.response.start",
-                "status": 401,
-                "headers": [(b"content-type", b"application/json"),
-                            (b"www-authenticate", b"Bearer")],
-            })
-            await send({"type": "http.response.body",
-                        "body": b'{"error":"unauthorized"}'})
-            return
-        await self.app(scope, receive, send)
+        accepted = self._accepted(scope.get("path", ""))
+        if bearer and bearer in accepted:
+            return await self.app(scope, receive, send)
+        if query_tokens & accepted:
+            return await self.app(scope, receive, send)
+
+        await send({
+            "type": "http.response.start",
+            "status": 401,
+            "headers": [(b"content-type", b"application/json"),
+                        (b"www-authenticate", b"Bearer")],
+        })
+        await send({"type": "http.response.body",
+                    "body": b'{"error":"unauthorized"}'})
+
+
+def _input_dir() -> str:
+    d = ARK_INPUT_DIR or os.path.join(tempfile.gettempdir(), "ark-image-inputs")
+    os.makedirs(d, exist_ok=True)
+    return d
+
+
+async def _handle_upload(request):
+    """POST /upload — accept raw image bytes and park them on this machine.
+
+    Remote clients (a phone app, a browser sandbox) can see their own files but
+    this server cannot, so they push the bytes here and then pass the returned
+    absolute `path` to the editing tools.
+    """
+    from starlette.responses import JSONResponse
+
+    limit = ARK_MAX_UPLOAD_MB * 1024 * 1024
+    declared = request.headers.get("content-length")
+    if declared and declared.isdigit() and int(declared) > limit:
+        return JSONResponse({"ok": False, "error": f"payload exceeds {ARK_MAX_UPLOAD_MB} MB"},
+                            status_code=413)
+
+    body = await request.body()
+    if not body:
+        return JSONResponse({"ok": False, "error": "empty body"}, status_code=400)
+    if len(body) > limit:
+        return JSONResponse({"ok": False, "error": f"payload exceeds {ARK_MAX_UPLOAD_MB} MB"},
+                            status_code=413)
+
+    # Validate it really is an image, and derive the extension from the format
+    # rather than trusting the filename.
+    ext = ".jpg"
+    if HAS_PIL:
+        try:
+            probe = PILImage.open(io.BytesIO(body))
+            probe.verify()
+            fmt = (probe.format or "JPEG").upper()
+            ext = {"JPEG": ".jpg", "PNG": ".png", "WEBP": ".webp",
+                   "GIF": ".gif", "BMP": ".bmp"}.get(fmt, ".jpg")
+        except Exception as e:
+            return JSONResponse({"ok": False, "error": f"not a decodable image: {e}"},
+                                status_code=400)
+
+    name = f"input_{uuid.uuid4().hex}{ext}"
+    path = os.path.join(_input_dir(), name)
+    with open(path, "wb") as fh:
+        fh.write(body)
+
+    logger.info("Received upload: %s (%d bytes)", name, len(body))
+    return JSONResponse({"ok": True, "path": path, "bytes": len(body),
+                         "hint": "Pass this absolute path as the `image` argument."})
+
+
+def _build_http_app():
+    """Add the /upload side-route to the MCP app.
+
+    The route is inserted into the MCP app's own router rather than wrapping it
+    in a parent Starlette app: wrapping drops the app's lifespan, which is what
+    starts the streamable-HTTP session manager, and every request then 500s.
+    """
+    from starlette.routing import Route
+
+    if ARK_TRANSPORT == "sse":
+        return mcp.sse_app()
+
+    inner = mcp.streamable_http_app()
+    inner.router.routes.insert(0, Route("/upload", _handle_upload, methods=["POST"]))
+    return inner
 
 
 def main() -> None:
@@ -1613,10 +1764,13 @@ def main() -> None:
     import uvicorn
 
     path = "/sse" if ARK_TRANSPORT == "sse" else ARK_HTTP_PATH
-    app = mcp.sse_app() if ARK_TRANSPORT == "sse" else mcp.streamable_http_app()
+    app = _build_http_app()
     logger.info("Serving MCP over %s at http://%s:%s%s (bearer auth required)",
                 ARK_TRANSPORT, ARK_HOST, ARK_PORT, path)
-    uvicorn.run(_BearerAuthMiddleware(app, ARK_MCP_TOKEN),
+    if ARK_TRANSPORT != "sse":
+        logger.info("Upload endpoint: POST http://%s:%s/upload (same bearer token)",
+                    ARK_HOST, ARK_PORT)
+    uvicorn.run(_BearerAuthMiddleware(app, ARK_MCP_TOKEN, ARK_UPLOAD_TOKEN),
                 host=ARK_HOST, port=ARK_PORT, log_level="info")
 
 

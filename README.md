@@ -119,6 +119,10 @@ tools over **streamable HTTP**:
 | `ARK_PORT` | `8765` | Listen port |
 | `ARK_HTTP_PATH` | `/mcp` | Endpoint path (`/sse` when `ARK_TRANSPORT=sse`) |
 | `ARK_MCP_TOKEN` | *(required for http)* | Bearer token every request must present |
+| `ARK_UPLOAD_TOKEN` | falls back to `ARK_MCP_TOKEN` | Upload-only credential for `POST /upload` |
+| `ARK_PUBLIC_BASE_URL` | derived from host/port | Public URL, used when wording instructions for remote clients |
+| `ARK_INPUT_DIR` | temp dir | Where `POST /upload` writes received images |
+| `ARK_MAX_UPLOAD_MB` | `25` | Max upload body size |
 
 ```bash
 ARK_API_KEY=ark-... \
@@ -146,6 +150,39 @@ Two things behave differently from stdio:
   refers to the *server's* filesystem, which the phone cannot see.
 - **Output files land on the server's disk.** Configure `ARK_UPLOAD_PROVIDER`
   (see above) so results also come back as `share_urls` you can open anywhere.
+
+### Images that only exist on the client
+
+When the server runs on a different machine than the client, a photo the user
+attached on their phone lives in the *client's* workspace and is unreadable here.
+Three ways to bridge that, in order of practicality:
+
+1. **`POST /upload`** — send the raw bytes, get back an absolute server path:
+
+   ```bash
+   curl -sS -X POST 'https://your-host/upload' \
+        -H 'Authorization: Bearer <ARK_UPLOAD_TOKEN>' \
+        --data-binary @photo.jpg
+   # -> {"ok":true,"path":"C:\\...\\input_ab12.jpg","bytes":363258}
+   ```
+
+   Give the returned `path` to any editing tool. The body must decode as an
+   image (JPEG/PNG/WebP/GIF/BMP) and the extension is derived from the real
+   format, not from your filename.
+
+   `ARK_UPLOAD_TOKEN` exists so a remote model can upload without holding the
+   MCP session credential: it authorizes **only** `/upload`, never tool calls.
+   The token is embedded in the MCP instructions so the model can build the
+   curl command itself — treat it as semi-public within your client.
+
+2. **`data:` URL** — `data:image/jpeg;base64,<payload>`, passed straight as an
+   `image` argument. Fine for small images; a 1 MB photo becomes ~1.4 M
+   characters of tool argument, which is expensive.
+
+3. **`b64:<payload>`** — the same bytes without the `data:` prefix.
+
+Relative paths are rejected with a message pointing at `/upload` rather than
+failing deep inside an HTTP client.
 
 Expose it over HTTPS before using it from a phone — put it behind a reverse
 proxy, a tunnel (Cloudflare Tunnel, ngrok, Tailscale Funnel), or a cloud VM
