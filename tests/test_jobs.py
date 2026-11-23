@@ -106,7 +106,8 @@ def test_instructions_describe_the_job_workflow():
     text = server.mcp.instructions
     assert "ark_start_job" in text
     assert "ark_job_status" in text
-    assert "524" in text
+    assert "ark_start_pipeline" in text
+    assert "connection error" in text
 
 
 # ---------- pipeline ----------
@@ -233,3 +234,38 @@ def test_job_worker_does_not_defer_again(monkeypatch):
     final = _wait(out["job_id"])
     assert final["status"] == "ok"
     assert calls == [None]      # nested defer refused
+
+
+# ---------- poll cap ----------
+
+def test_poll_cap_is_short_over_http(monkeypatch):
+    """The client cuts silent requests near 40 s, so a poll must stay well under."""
+    monkeypatch.setattr(server, "ARK_TRANSPORT", "http")
+    assert server._poll_cap() <= 10
+
+
+def test_poll_cap_is_generous_over_stdio(monkeypatch):
+    monkeypatch.setattr(server, "ARK_TRANSPORT", "stdio")
+    assert server._poll_cap() == 60
+
+
+def test_job_status_honours_the_http_cap(monkeypatch):
+    """Asking for 40 s over HTTP must not actually block 40 s."""
+    monkeypatch.setattr(server, "ARK_TRANSPORT", "http")
+    monkeypatch.setattr(server, "_JOB_POLL_MAX_HTTP", 1)
+    server._JOBS.clear()
+    server._JOBS["slow"] = {"id": "slow", "tool": "spare", "status": "running",
+                            "done": False, "result": None, "error": None,
+                            "started": time.time(), "updated": time.time()}
+    started = time.time()
+    out = server.ark_job_status("slow", wait_seconds=40)
+    assert time.time() - started < 5
+    assert out["status"] == "running"
+    assert "wait_seconds=1" in out["hint"]
+    server._JOBS.clear()
+
+
+def test_instructions_tell_the_model_short_polls():
+    text = server.mcp.instructions
+    assert "wait_seconds=40" not in text
+    assert "wait_seconds=8" in text

@@ -99,27 +99,25 @@ mcp = FastMCP(
         "ark_upload_image returns {\"ok\": true, \"path\": ...}; if it fails, report the error to the "
         "user instead of retrying other transports.\n\n"
         "*** NEVER CALL TOOLS CONCURRENTLY ***\n"
-        "Issue exactly ONE tool call per turn and wait for its result. A proxied connection is cut "
-        "after ~100 s of silence, and parallel calls make it far worse: two vision calls at once "
-        "contend for the upstream API (measured: 81 s alone, 161 s when racing) and the proxy kills "
-        "the slower one with a 524, after which the client often cannot reconnect at all. Serial is "
-        "not slower in practice — it is the only thing that survives.\n\n"
-        "*** SLOW TOOLS -> BACKGROUND JOBS ***\n"
-        "These can exceed the timeout: ark_analyze_image, ark_locate_object, ark_verify_edit, "
-        "ark_edit_image, ark_revise_image, ark_portrait_from_ref, "
-        "ark_generate_identity_templates, ark_scene_profile, ark_show_image. "
-        "Call them through a job instead of directly:\n"
-        "    ark_start_job(tool='ark_edit_image', arguments='{\"intent\":..., \"image\":...}')\n"
-        "  -> returns {\"job_id\": ...} immediately; then poll ark_job_status(job_id, wait_seconds=40) "
-        "until status is 'ok' or 'error'. Its `result` is the tool's normal output.\n"
-        "For a multi-step flow (analyse -> edit -> verify) use ONE pipeline, not three calls:\n"
-        "    ark_start_pipeline(steps='[{\"tool\":\"ark_analyze_image\",\"arguments\":{...}}, "
-        "{\"tool\":\"ark_edit_image\",\"arguments\":{...}}]')\n"
-        "  Steps run in order on the server; poll the same way. This is the recommended path for "
-        "any edit that needs looking at the image first.\n"
-        "Only trivially fast tools (ark_recent_uploads, ark_upload_image) are safe to call directly.\n"
-        "If a direct call fails with a connection error or 524, that is this timeout, not a real "
-        "failure — redo it through ark_start_job/ark_start_pipeline rather than reporting a bug.\n\n"
+        "Issue exactly ONE tool call per turn and wait for its result. Parallel calls contend for "
+        "the upstream vision API (measured: 81 s alone vs 161 s when racing) and the slower one gets "
+        "killed. Serial is not slower in practice — it is the only thing that survives.\n\n"
+        "*** SLOW TOOLS RETURN A JOB HANDLE — POLL IT ***\n"
+        "Over HTTP the slow tools do not block: calling ark_analyze_image, ark_locate_object, "
+        "ark_verify_edit, ark_edit_image, ark_revise_image, ark_portrait_from_ref, "
+        "ark_generate_identity_templates, ark_scene_profile or ark_generate_image returns "
+        "{\"ok\": true, \"job_id\": ..., \"status\": \"running\"} in milliseconds. That is SUCCESS, "
+        "not a failure — do not retry it. Immediately continue with:\n"
+        "    ark_job_status(job_id='<that id>', wait_seconds=8)\n"
+        "and repeat while status is 'running'. A job takes many short polls; that is normal. "
+        "This client cuts a silent request after roughly 40 seconds, so NEVER ask for a long wait "
+        "(wait_seconds is capped at 8 for exactly that reason) and never sit idle between polls.\n"
+        "ark_start_job(tool=..., arguments=<JSON string>) and ark_start_pipeline(steps=<JSON array>) "
+        "do the same thing explicitly; a pipeline runs analyse -> edit -> verify in one job and is "
+        "the best way to do a multi-step edit.\n"
+        "Only trivially fast tools (ark_recent_uploads, ark_upload_image) return their result inline.\n"
+        "If a poll dies with a connection error, just call ark_job_status again with the same "
+        "job_id — the job keeps running on the server.\n\n"
         "Two models power this server (handled internally):\n"
         "- Seedream 5.0 pro: generates/edits images (image-to-image).\n"
         "- Doubao Seed 2.1 pro (vision): reads reference images and rewrites edit intent into detailed "
@@ -1031,6 +1029,18 @@ def ark_upload_image(data: str, filename: str = "", upload_id: str = "",
 _JOBS: dict = {}
 _JOB_TTL = 3600
 _JOB_MAX = 32
+
+# How long a single ark_job_status poll may block. A mobile client was measured
+# cutting a silent request at ~40 s, so a poll must stay well under that — the
+# point of polling is many short requests, not one long one.
+_JOB_POLL_MAX_HTTP = int(os.environ.get("ARK_JOB_POLL_MAX", "8"))
+_JOB_POLL_MAX_STDIO = 60
+
+
+def _poll_cap() -> int:
+    return _JOB_POLL_MAX_HTTP if ARK_TRANSPORT != "stdio" else _JOB_POLL_MAX_STDIO
+
+
 _SLOW_TOOLS = {
     "ark_generate_image",
     "ark_edit_image",
@@ -1130,8 +1140,9 @@ def ark_start_job(tool: str, arguments: str = "{}") -> dict:
 
     _sweep_jobs()
     return _spawn_job(name, kwargs,
-                      hint="Poll ark_job_status(job_id) every few seconds until status is "
-                           "'ok' or 'error'. Keep each poll fast.")
+                      hint="Poll ark_job_status(job_id, wait_seconds=8) until status is "
+                           "'ok' or 'error'. Short polls; the client cuts silent requests "
+                           "near 40 s.")
 
 
 def _spawn_job(tool_name: str, kwargs: dict, hint: str = "") -> dict:
@@ -1159,7 +1170,7 @@ def _spawn_job(tool_name: str, kwargs: dict, hint: str = "") -> dict:
     threading.Thread(target=_run, name=f"ark-job-{job_id}", daemon=True).start()
     logger.info("Started background job %s for %s", job_id, tool_name)
     return _ok(job_id=job_id, tool=tool_name, status="running",
-               hint=hint or "Poll ark_job_status(job_id).")
+               hint=hint or "Poll ark_job_status(job_id, wait_seconds=8).")
 
 
 @mcp.tool()
@@ -1240,22 +1251,24 @@ def ark_start_pipeline(steps: str) -> dict:
     threading.Thread(target=_run, name=f"ark-pipe-{job_id}", daemon=True).start()
     logger.info("Started pipeline %s with %d step(s)", job_id, len(normalised))
     return _ok(job_id=job_id, tool="pipeline", steps=len(normalised), status="running",
-               hint="Poll ark_job_status(job_id); the run is sequential and may take "
-                    "several minutes.")
+               hint="Poll ark_job_status(job_id, wait_seconds=8) until it finishes. "
+                    "Steps run sequentially, so expect several short polls.")
 
 
 @mcp.tool()
 def ark_job_status(job_id: str, wait_seconds: int = 0) -> dict:
-    """Check a background job started with ark_start_job.
+    """Check a background job started with ark_start_job / ark_start_pipeline.
 
     Args:
-        job_id: the id returned by ark_start_job.
-        wait_seconds: how long to block waiting for completion (0-60). Raising it
-                      to ~40 means fewer round trips; keep it well under the
-                      proxy's timeout.
+        job_id: the id returned when the job was submitted.
+        wait_seconds: how long this poll may block (capped at 8 s over HTTP, 60 s
+                      over stdio). Call it repeatedly: polling is meant to be a
+                      series of SHORT requests. Do not ask for a long wait — the
+                      client cuts a silent request after ~40 s.
 
-    Returns {"ok": true, "status": "running"|"ok"|"error", "result": {...}}.
-    The `result` field is exactly what the underlying tool would have returned.
+    Returns {"ok": true, "status": "running"|"ok"|"error", ...}.
+    While running it also returns `elapsed` and a `hint`; once finished, `result`
+    holds exactly what the underlying tool would have returned.
     """
     job = _JOBS.get((job_id or "").strip())
     if job is None:
@@ -1263,7 +1276,8 @@ def ark_job_status(job_id: str, wait_seconds: int = 0) -> dict:
                     f"unknown job_id {job_id!r}; it may have expired "
                     f"({_JOB_TTL}s after completion)")
 
-    wait = max(0, min(int(wait_seconds or 0), 60))
+    cap = _poll_cap()
+    wait = max(0, min(int(wait_seconds or 0), cap))
     deadline = time.time() + wait
     while not job["done"] and time.time() < deadline:
         time.sleep(0.25)
@@ -1271,7 +1285,8 @@ def ark_job_status(job_id: str, wait_seconds: int = 0) -> dict:
     if not job["done"]:
         return _ok(job_id=job_id, status="running", tool=job["tool"],
                    elapsed=round(time.time() - job["started"], 1),
-                   hint="Not finished yet; poll again.")
+                   hint=f"Not finished yet. Call ark_job_status again with "
+                        f"wait_seconds={cap} — short polls are expected.")
 
     _sweep_jobs()
     if job["status"] == "ok":
