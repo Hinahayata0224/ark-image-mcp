@@ -213,10 +213,27 @@ ark_job_status(job_id="b3d01b45201c4f4e", wait_seconds=40)
   -> {"ok": true, "status": "ok", "result": {...}}           # tool's normal output
 ```
 
+**Over HTTP the slow tools defer themselves.** Mobile clients were measured
+cutting a silent request at ~40 s — a direct `ark_analyze_image` died at exactly
+40 s while the same call finished in 24 s from curl — so leaving it to the model
+to choose `ark_start_job` is not reliable. When `ARK_TRANSPORT` is not `stdio`,
+calling any of `ark_generate_image`, `ark_edit_image`, `ark_revise_image`,
+`ark_portrait_from_ref`, `ark_generate_identity_templates`, `ark_scene_profile`,
+`ark_analyze_image`, `ark_locate_object` or `ark_verify_edit` returns
+`{"ok": true, "job_id": ..., "status": "running"}` in milliseconds instead of
+blocking; poll with `ark_job_status`. Under stdio they still return the real
+result synchronously, so desktop clients are unaffected. A job worker never
+defers again, so nesting is safe.
+
 `wait_seconds` is capped at 60 so a single poll cannot itself hit the timeout.
 Finished jobs are kept for an hour (bounded to 32) so a client can still read
-the result after a hiccup. `ark_generate_image` alone is usually fast enough to
-call directly.
+the result after a hiccup.
+
+`ark_start_pipeline` runs several steps in one job, strictly in order. Use it
+for analyse → edit → verify flows: concurrent calls are not just wasteful, they
+contend for the vision API (81 s alone vs 161 s when raced, measured) and the
+slower one gets killed. Individual step failures are recorded without aborting
+the run.
 
 Expose it over HTTPS before using it from a phone — put it behind a reverse
 proxy, a tunnel (Cloudflare Tunnel, ngrok, Tailscale Funnel), or a cloud VM

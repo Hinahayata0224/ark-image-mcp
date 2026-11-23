@@ -5,6 +5,7 @@ import logging
 import os
 import re
 import tempfile
+import threading
 import time
 import urllib.parse
 import uuid
@@ -261,6 +262,11 @@ class ImageResult(BaseModel):
     notes: Optional[list] = None
     refined_prompt: Optional[str] = None
     errors: Optional[list] = None
+    # Set when the call was deferred to a background job (HTTP transport); the
+    # real output then arrives via ark_job_status.
+    job_id: Optional[str] = None
+    status: Optional[str] = None
+    hint: Optional[str] = None
 
 
 class SceneProfileResult(BaseModel):
@@ -270,6 +276,9 @@ class SceneProfileResult(BaseModel):
     error: Optional[str] = None
     profile: Optional[str] = None
     images: Optional[int] = None
+    job_id: Optional[str] = None
+    status: Optional[str] = None
+    hint: Optional[str] = None
 
 
 def _unique_path(output_dir: str, ext: str) -> str:
@@ -552,6 +561,10 @@ def ark_scene_profile(images: str, focus: Optional[str] = None) -> SceneProfileR
         focus: Optional hint for what the profile should emphasize (e.g.
                "the girl's outfit and the classroom background")
     """
+    _deferred = _auto_defer("ark_scene_profile", {"images": images, "focus": focus})
+    if _deferred is not None:
+        return _deferred
+
     if not ARK_API_KEY:
         return _err("config", "ARK_API_KEY environment variable is not set.")
     if not images or not images.strip():
@@ -759,6 +772,10 @@ def ark_analyze_image(
         region: Optional region to focus on, as [x1,y1,x2,y2] in 0-1000 normalized
                 coordinates (top-left origin), e.g. "[200,100,600,500]"
     """
+    _deferred = _auto_defer("ark_analyze_image", {"image": image, "query": query, "region": region})
+    if _deferred is not None:
+        return _deferred
+
     if not ARK_API_KEY:
         return _err("config", "ARK_API_KEY environment variable is not set.")
     if not image or not image.strip():
@@ -794,6 +811,10 @@ def ark_locate_object(
         image: Local path or URL of the image
         object_desc: What to find, e.g. "the girl's head" or "the coffee cup"
     """
+    _deferred = _auto_defer("ark_locate_object", {"image": image, "object_desc": object_desc})
+    if _deferred is not None:
+        return _deferred
+
     if not ARK_API_KEY:
         return _err("config", "ARK_API_KEY environment variable is not set.")
     if not image or not image.strip():
@@ -1025,6 +1046,43 @@ _SLOW_TOOLS = {
     "ark_show_image",
 }
 
+# Tools that always run as a background job when serving over HTTP. Mobile
+# clients cut a silent request at roughly 40 s — measured: a direct vision call
+# died at exactly 40 s while the same call succeeded in 24 s from curl — so an
+# inline call is not reliable no matter what the instructions say. Deferring
+# here makes the HTTP request return in milliseconds regardless of the tool.
+_AUTO_DEFER_TOOLS = {
+    "ark_generate_image",
+    "ark_edit_image",
+    "ark_revise_image",
+    "ark_portrait_from_ref",
+    "ark_generate_identity_templates",
+    "ark_scene_profile",
+    "ark_analyze_image",
+    "ark_locate_object",
+    "ark_verify_edit",
+}
+
+# Set while a job worker runs a tool, so the tool does not defer itself again.
+_JOB_CONTEXT = threading.local()
+
+
+def _auto_defer_enabled() -> bool:
+    """Deferring only makes sense when each tool call is its own HTTP request."""
+    return ARK_TRANSPORT != "stdio" and not getattr(_JOB_CONTEXT, "active", False)
+
+
+def _auto_defer(tool_name: str, kwargs: dict):
+    """Start a background job for this call, or return None to run inline."""
+    if not _auto_defer_enabled() or tool_name not in _AUTO_DEFER_TOOLS:
+        return None
+    return _spawn_job(
+        tool_name, kwargs,
+        hint="Running as a background job: remote clients cut long requests. Poll "
+             "ark_job_status(job_id) until status is 'ok' or 'error'; its `result` "
+             "field is this tool's normal output.",
+    )
+
 
 def _sweep_jobs(now: Optional[float] = None) -> None:
     now = time.time() if now is None else now
@@ -1071,28 +1129,37 @@ def ark_start_job(tool: str, arguments: str = "{}") -> dict:
         return _err("invalid_argument", "arguments must be a JSON object")
 
     _sweep_jobs()
+    return _spawn_job(name, kwargs,
+                      hint="Poll ark_job_status(job_id) every few seconds until status is "
+                           "'ok' or 'error'. Keep each poll fast.")
+
+
+def _spawn_job(tool_name: str, kwargs: dict, hint: str = "") -> dict:
+    """Create a job that runs tool_name(**kwargs) on a worker thread."""
+    fn = globals()[tool_name]
     job_id = uuid.uuid4().hex[:16]
-    job = {"id": job_id, "tool": name, "status": "running", "done": False,
+    job = {"id": job_id, "tool": tool_name, "status": "running", "done": False,
            "result": None, "error": None, "started": time.time(), "updated": time.time()}
     _JOBS[job_id] = job
 
     def _run():
+        _JOB_CONTEXT.active = True          # never re-defer inside the worker
         try:
             job["result"] = fn(**kwargs)
             job["status"] = "ok"
         except Exception as exc:  # surface the failure instead of losing the thread
-            logger.exception("Background job %s (%s) failed", job_id, name)
+            logger.exception("Background job %s (%s) failed", job_id, tool_name)
             job["error"] = f"{type(exc).__name__}: {exc}"
             job["status"] = "error"
         finally:
+            _JOB_CONTEXT.active = False
             job["done"] = True
             job["updated"] = time.time()
 
     threading.Thread(target=_run, name=f"ark-job-{job_id}", daemon=True).start()
-    logger.info("Started background job %s for %s", job_id, name)
-    return _ok(job_id=job_id, tool=name, status="running",
-               hint="Poll ark_job_status(job_id) every few seconds until status is "
-                    "'ok' or 'error'. Keep each poll fast.")
+    logger.info("Started background job %s for %s", job_id, tool_name)
+    return _ok(job_id=job_id, tool=tool_name, status="running",
+               hint=hint or "Poll ark_job_status(job_id).")
 
 
 @mcp.tool()
@@ -1152,14 +1219,19 @@ def ark_start_pipeline(steps: str) -> dict:
 
     def _run():
         outcomes = []
-        for name, args in normalised:
-            try:
-                outcomes.append({"tool": name, "ok": True, "result": globals()[name](**args)})
-            except Exception as exc:
-                logger.exception("Pipeline %s step %s failed", job_id, name)
-                outcomes.append({"tool": name, "ok": False,
-                                 "error": f"{type(exc).__name__}: {exc}"})
-            job["updated"] = time.time()
+        _JOB_CONTEXT.active = True          # steps must not defer themselves
+        try:
+            for name, args in normalised:
+                try:
+                    outcomes.append({"tool": name, "ok": True,
+                                     "result": globals()[name](**args)})
+                except Exception as exc:
+                    logger.exception("Pipeline %s step %s failed", job_id, name)
+                    outcomes.append({"tool": name, "ok": False,
+                                     "error": f"{type(exc).__name__}: {exc}"})
+                job["updated"] = time.time()
+        finally:
+            _JOB_CONTEXT.active = False
         job["result"] = {"ok": True, "completed": outcomes}
         job["status"] = "ok"
         job["done"] = True
@@ -1369,6 +1441,10 @@ def ark_generate_image(
         watermark: Whether to add watermark
         response_format: Response format. Either "url" (returns downloadable URLs) or "b64_json" (base64-encoded images)
     """
+    _deferred = _auto_defer("ark_generate_image", {"prompt": prompt, "image": image, "size": size, "watermark": watermark, "response_format": response_format})
+    if _deferred is not None:
+        return _deferred
+
     if not ARK_API_KEY:
         return _err("config", "ARK_API_KEY environment variable is not set.")
     if not prompt or not prompt.strip():
@@ -1521,6 +1597,10 @@ def ark_edit_image(
         context_images: Optional comma-separated additional same-scene photos, used as
                 visual memory for the prompt refinement (consistency across the scene)
     """
+    _deferred = _auto_defer("ark_edit_image", {"intent": intent, "image": image, "size": size, "watermark": watermark, "scene_profile": scene_profile, "region": region, "mask": mask, "context_images": context_images})
+    if _deferred is not None:
+        return _deferred
+
     if not ARK_API_KEY:
         return _err("config", "ARK_API_KEY environment variable is not set.")
     if not intent or not intent.strip():
@@ -1626,6 +1706,10 @@ def ark_revise_image(
         watermark: Whether to add watermark
         scene_profile: Optional scene profile text from ark_scene_profile
     """
+    _deferred = _auto_defer("ark_revise_image", {"revision": revision, "image": image, "reference": reference, "size": size, "watermark": watermark, "scene_profile": scene_profile})
+    if _deferred is not None:
+        return _deferred
+
     if not ARK_API_KEY:
         return _err("config", "ARK_API_KEY environment variable is not set.")
     if not revision or not revision.strip():
@@ -1778,6 +1862,10 @@ def ark_verify_edit(
         edited: Local path or URL of the edited result image
         intent: The edit intent that was requested
     """
+    _deferred = _auto_defer("ark_verify_edit", {"original": original, "edited": edited, "intent": intent})
+    if _deferred is not None:
+        return _deferred
+
     if not ARK_API_KEY:
         return _err("config", "ARK_API_KEY environment variable is not set.")
     if not original or not edited or not intent:
@@ -1838,6 +1926,10 @@ def ark_portrait_from_ref(
         size: Image size. Square presets "1K"/"2K"/"4K" or "WIDTHxHEIGHT"
         watermark: Whether to add watermark
     """
+    _deferred = _auto_defer("ark_portrait_from_ref", {"image": image, "style_ref": style_ref, "scene_profile": scene_profile, "intent": intent, "size": size, "watermark": watermark})
+    if _deferred is not None:
+        return _deferred
+
     if not ARK_API_KEY:
         return _err("config", "ARK_API_KEY environment variable is not set.")
     if not image or not image.strip():
@@ -1958,6 +2050,10 @@ def ark_generate_identity_templates(
         images: Comma-separated local paths or URLs of the person's photos
         count: How many templates to generate (1-5), from the preset list in order
     """
+    _deferred = _auto_defer("ark_generate_identity_templates", {"images": images, "count": count})
+    if _deferred is not None:
+        return _deferred
+
     if not ARK_API_KEY:
         return _err("config", "ARK_API_KEY environment variable is not set.")
     if not images or not images.strip():

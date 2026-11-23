@@ -186,3 +186,50 @@ def test_instructions_forbid_concurrent_calls():
     text = server.mcp.instructions
     assert "NEVER CALL TOOLS CONCURRENTLY" in text
     assert "ark_start_pipeline" in text
+
+
+# ---------- auto-defer in HTTP mode ----------
+
+def test_auto_defer_is_off_for_stdio(monkeypatch):
+    """Desktop clients must keep getting the real result synchronously."""
+    monkeypatch.setattr(server, "ARK_TRANSPORT", "stdio")
+    assert server._auto_defer("ark_analyze_image", {"image": "x", "query": "y"}) is None
+
+
+def test_auto_defer_returns_job_handle_over_http(monkeypatch):
+    """Mobile clients cut a silent request at ~40 s, so the call must return now."""
+    monkeypatch.setattr(server, "ARK_TRANSPORT", "http")
+    server._JOBS.clear()
+    monkeypatch.setattr(server, "ark_analyze_image", lambda **kw: {"ok": True, "profile": "p"})
+
+    out = server._auto_defer("ark_analyze_image", {"image": "x", "query": "y"})
+    assert out is not None
+    assert out["ok"] is True
+    assert out["status"] == "running"
+    assert out["job_id"]
+
+    final = _wait(out["job_id"])
+    assert final["status"] == "ok"
+    assert final["result"]["profile"] == "p"
+
+
+def test_auto_defer_skips_fast_tools(monkeypatch):
+    monkeypatch.setattr(server, "ARK_TRANSPORT", "http")
+    assert server._auto_defer("ark_recent_uploads", {"limit": 1}) is None
+
+
+def test_job_worker_does_not_defer_again(monkeypatch):
+    """A deferred tool re-entering _auto_defer would recurse forever."""
+    monkeypatch.setattr(server, "ARK_TRANSPORT", "http")
+
+    calls = []
+
+    def fake(**kw):
+        calls.append(server._auto_defer("ark_analyze_image", {"image": "x", "query": "y"}))
+        return {"ok": True}
+
+    monkeypatch.setattr(server, "ark_analyze_image", fake)
+    out = server._auto_defer("ark_analyze_image", {"image": "x", "query": "y"})
+    final = _wait(out["job_id"])
+    assert final["status"] == "ok"
+    assert calls == [None]      # nested defer refused
