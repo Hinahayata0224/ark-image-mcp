@@ -97,16 +97,28 @@ mcp = FastMCP(
         "an order of magnitude and does not hurt editing quality.\n"
         "ark_upload_image returns {\"ok\": true, \"path\": ...}; if it fails, report the error to the "
         "user instead of retrying other transports.\n\n"
-        "*** SLOW CALLS AND PROXY TIMEOUTS ***\n"
-        "A proxied MCP connection is cut after roughly 100 seconds of silence, while editing "
-        "(vision rewrite + generation) routinely needs 2-3 minutes. So for ark_edit_image, "
-        "ark_revise_image, ark_portrait_from_ref and ark_generate_identity_templates, prefer:\n"
+        "*** NEVER CALL TOOLS CONCURRENTLY ***\n"
+        "Issue exactly ONE tool call per turn and wait for its result. A proxied connection is cut "
+        "after ~100 s of silence, and parallel calls make it far worse: two vision calls at once "
+        "contend for the upstream API (measured: 81 s alone, 161 s when racing) and the proxy kills "
+        "the slower one with a 524, after which the client often cannot reconnect at all. Serial is "
+        "not slower in practice — it is the only thing that survives.\n\n"
+        "*** SLOW TOOLS -> BACKGROUND JOBS ***\n"
+        "These can exceed the timeout: ark_analyze_image, ark_locate_object, ark_verify_edit, "
+        "ark_edit_image, ark_revise_image, ark_portrait_from_ref, "
+        "ark_generate_identity_templates, ark_scene_profile, ark_show_image. "
+        "Call them through a job instead of directly:\n"
         "    ark_start_job(tool='ark_edit_image', arguments='{\"intent\":..., \"image\":...}')\n"
-        "  -> returns {\"job_id\": ...} immediately; then call ark_job_status(job_id, wait_seconds=40) "
-        "and repeat until status is 'ok' or 'error'. The `result` field is the tool's normal output. "
-        "ark_generate_image alone is usually fast enough to call directly.\n"
+        "  -> returns {\"job_id\": ...} immediately; then poll ark_job_status(job_id, wait_seconds=40) "
+        "until status is 'ok' or 'error'. Its `result` is the tool's normal output.\n"
+        "For a multi-step flow (analyse -> edit -> verify) use ONE pipeline, not three calls:\n"
+        "    ark_start_pipeline(steps='[{\"tool\":\"ark_analyze_image\",\"arguments\":{...}}, "
+        "{\"tool\":\"ark_edit_image\",\"arguments\":{...}}]')\n"
+        "  Steps run in order on the server; poll the same way. This is the recommended path for "
+        "any edit that needs looking at the image first.\n"
+        "Only trivially fast tools (ark_recent_uploads, ark_upload_image) are safe to call directly.\n"
         "If a direct call fails with a connection error or 524, that is this timeout, not a real "
-        "failure — retry the same work through ark_start_job instead of telling the user it broke.\n\n"
+        "failure — redo it through ark_start_job/ark_start_pipeline rather than reporting a bug.\n\n"
         "Two models power this server (handled internally):\n"
         "- Seedream 5.0 pro: generates/edits images (image-to-image).\n"
         "- Doubao Seed 2.1 pro (vision): reads reference images and rewrites edit intent into detailed "
@@ -1005,6 +1017,12 @@ _SLOW_TOOLS = {
     "ark_portrait_from_ref",
     "ark_generate_identity_templates",
     "ark_scene_profile",
+    # Vision calls are slow too — a single one takes 15-80 s, and two running at
+    # once contend for the vision API and push past the proxy's 100 s limit.
+    "ark_analyze_image",
+    "ark_locate_object",
+    "ark_verify_edit",
+    "ark_show_image",
 }
 
 
@@ -1075,6 +1093,83 @@ def ark_start_job(tool: str, arguments: str = "{}") -> dict:
     return _ok(job_id=job_id, tool=name, status="running",
                hint="Poll ark_job_status(job_id) every few seconds until status is "
                     "'ok' or 'error'. Keep each poll fast.")
+
+
+@mcp.tool()
+def ark_start_pipeline(steps: str) -> dict:
+    """Run several slow tools back-to-back in one background job.
+
+    This is the safest way to do a multi-step edit remotely. Each step would
+    otherwise need its own round trip, and issuing them concurrently is worse:
+    parallel vision calls contend for the upstream API and blow past the
+    proxy's ~100 s ceiling. Here the server runs them strictly in order and the
+    client only polls once.
+
+    Args:
+        steps: JSON array, each item {"tool": "<name>", "arguments": {...}}.
+               Example:
+               '[{"tool":"ark_analyze_image","arguments":{"image":"C:/in.jpg","query":"where is the eye?"}},
+                 {"tool":"ark_edit_image","arguments":{"intent":"open the eye","image":"C:/in.jpg"}},
+                 {"tool":"ark_verify_edit","arguments":{"original":"C:/in.jpg","edited":"<path from step 2>","intent":"open the eye"}}]'
+
+               Steps run in the order given. Individual step failures do not
+               abort the run; each step's outcome is reported in `steps`.
+
+    Returns {"ok": true, "job_id": ..., "steps": N}. Poll ark_job_status(job_id)
+    as usual; its `result` will be {"ok": true, "completed": [[...]]} with one
+    entry per step.
+    """
+    import threading
+
+    try:
+        plan = json.loads(steps) if steps.strip() else []
+    except json.JSONDecodeError as e:
+        return _err("invalid_argument", f"steps is not valid JSON: {e}")
+    if not isinstance(plan, list) or not plan:
+        return _err("invalid_argument", "steps must be a non-empty JSON array")
+
+    normalised = []
+    for i, step in enumerate(plan):
+        if not isinstance(step, dict):
+            return _err("invalid_argument", f"step {i} is not an object")
+        name = str(step.get("tool", "")).strip()
+        if name not in _SLOW_TOOLS:
+            return _err("invalid_argument",
+                        f"step {i}: {name!r} is not a background-capable tool; "
+                        f"expected one of {sorted(_SLOW_TOOLS)}")
+        if not callable(globals().get(name)):
+            return _err("config", f"step {i}: tool {name!r} is not available in this build")
+        args = step.get("arguments") or {}
+        if not isinstance(args, dict):
+            return _err("invalid_argument", f"step {i}: arguments must be an object")
+        normalised.append((name, args))
+
+    _sweep_jobs()
+    job_id = uuid.uuid4().hex[:16]
+    job = {"id": job_id, "tool": "pipeline", "status": "running", "done": False,
+           "result": None, "error": None, "started": time.time(), "updated": time.time()}
+    _JOBS[job_id] = job
+
+    def _run():
+        outcomes = []
+        for name, args in normalised:
+            try:
+                outcomes.append({"tool": name, "ok": True, "result": globals()[name](**args)})
+            except Exception as exc:
+                logger.exception("Pipeline %s step %s failed", job_id, name)
+                outcomes.append({"tool": name, "ok": False,
+                                 "error": f"{type(exc).__name__}: {exc}"})
+            job["updated"] = time.time()
+        job["result"] = {"ok": True, "completed": outcomes}
+        job["status"] = "ok"
+        job["done"] = True
+        job["updated"] = time.time()
+
+    threading.Thread(target=_run, name=f"ark-pipe-{job_id}", daemon=True).start()
+    logger.info("Started pipeline %s with %d step(s)", job_id, len(normalised))
+    return _ok(job_id=job_id, tool="pipeline", steps=len(normalised), status="running",
+               hint="Poll ark_job_status(job_id); the run is sequential and may take "
+                    "several minutes.")
 
 
 @mcp.tool()

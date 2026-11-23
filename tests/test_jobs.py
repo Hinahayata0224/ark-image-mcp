@@ -1,4 +1,5 @@
 """Tests for background jobs (the proxy-timeout workaround)."""
+import json
 import time
 
 import server
@@ -106,3 +107,82 @@ def test_instructions_describe_the_job_workflow():
     assert "ark_start_job" in text
     assert "ark_job_status" in text
     assert "524" in text
+
+
+# ---------- pipeline ----------
+
+def test_pipeline_runs_steps_in_order(monkeypatch):
+    order = []
+
+    def step_a(**kw):
+        order.append("a")
+        return {"ok": True, "n": 1}
+
+    def step_b(**kw):
+        order.append("b")
+        return {"ok": True, "n": 2}
+
+    monkeypatch.setattr(server, "ark_analyze_image", step_a)
+    monkeypatch.setattr(server, "ark_locate_object", step_b)
+
+    steps = json.dumps([
+        {"tool": "ark_analyze_image", "arguments": {"image": "x.jpg", "query": "q"}},
+        {"tool": "ark_locate_object", "arguments": {"image": "x.jpg", "object_desc": "head"}},
+    ])
+    out = server.ark_start_pipeline(steps)
+    assert out["ok"] is True
+    assert out["steps"] == 2
+
+    final = _wait(out["job_id"])
+    assert final["status"] == "ok"
+    completed = final["result"]["completed"]
+    assert [c["tool"] for c in completed] == ["ark_analyze_image", "ark_locate_object"]
+    assert order == ["a", "b"]
+
+
+def test_pipeline_continues_after_a_failing_step(monkeypatch):
+    def boom(**kw):
+        raise RuntimeError("vision down")
+
+    monkeypatch.setattr(server, "ark_analyze_image", boom)
+    monkeypatch.setattr(server, "ark_locate_object", lambda **kw: {"ok": True})
+
+    steps = json.dumps([
+        {"tool": "ark_analyze_image", "arguments": {"image": "x.jpg", "query": "q"}},
+        {"tool": "ark_locate_object", "arguments": {"image": "x.jpg", "object_desc": "head"}},
+    ])
+    final = _wait(server.ark_start_pipeline(steps)["job_id"])
+    completed = final["result"]["completed"]
+    assert completed[0]["ok"] is False
+    assert "vision down" in completed[0]["error"]
+    assert completed[1]["ok"] is True
+
+
+def test_pipeline_rejects_bad_json():
+    out = server.ark_start_pipeline("{oops")
+    assert out["ok"] is False
+    assert "not valid JSON" in out["error"]
+
+
+def test_pipeline_rejects_empty_list():
+    out = server.ark_start_pipeline("[]")
+    assert out["ok"] is False
+    assert "non-empty" in out["error"]
+
+
+def test_pipeline_rejects_fast_only_tool():
+    out = server.ark_start_pipeline(json.dumps([{"tool": "ark_recent_uploads", "arguments": {}}]))
+    assert out["ok"] is False
+    assert "not a background-capable tool" in out["error"]
+
+
+def test_vision_tools_are_background_capable():
+    """These took 15-80 s each and timed out when raced through the proxy."""
+    for name in ("ark_analyze_image", "ark_locate_object", "ark_verify_edit"):
+        assert name in server._SLOW_TOOLS
+
+
+def test_instructions_forbid_concurrent_calls():
+    text = server.mcp.instructions
+    assert "NEVER CALL TOOLS CONCURRENTLY" in text
+    assert "ark_start_pipeline" in text
