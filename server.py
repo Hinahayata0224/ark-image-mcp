@@ -58,6 +58,16 @@ def upload_hint(source: str = "<local file>") -> str:
             f"-H 'Authorization: Bearer {token}' "
             f"--data-binary '@{source}'")
 
+
+def upload_page_url() -> str:
+    """The browser upload page URL, with the upload token embedded for convenience."""
+    base = ARK_PUBLIC_BASE_URL
+    if not base:
+        base = (f"http://127.0.0.1:{ARK_PORT}" if ARK_HOST in ("127.0.0.1", "localhost")
+                else f"http://{ARK_HOST}:{ARK_PORT}")
+    token = ARK_UPLOAD_TOKEN or ARK_MCP_TOKEN
+    return f"{base}/upload?token={urllib.parse.quote(token)}" if token else f"{base}/upload"
+
 mcp = FastMCP(
     "ark-image-gen",
     instructions=(
@@ -66,13 +76,15 @@ mcp = FastMCP(
         "This server may run on a DIFFERENT machine than your client. A file the user attached in "
         "the chat (e.g. 'input/image-abc.jpg', or any workspace-relative path) does NOT exist here. "
         "Do not guess server paths, do not search the server's disk, and do not try to rewrite the "
-        "relative path. Pick the first option that applies:\n"
+        "relative path. In order of preference:\n"
+        "  0. BEST FOR PHONES: tell the user to open <UPLOAD_PAGE> in a phone browser and pick the "
+        "photo there. The browser uploads it directly — no base64 in the conversation, no shell "
+        "needed, any file size. Afterwards call ark_recent_uploads() and use files[0].path. "
+        "Suggest this first whenever the image is large or your sandbox cannot run shell commands.\n"
         "  1. If your client can give you a PUBLIC http(s) URL for that image (a download link that "
-        "opens in a normal browser), pass that URL as the `image` argument. Zero extra cost — try "
-        "this first if such a link is available.\n"
+        "opens in a normal browser), pass that URL as the `image` argument. Zero extra cost.\n"
         "  2. Otherwise call ark_upload_image and pass the returned `path` as `image`. This travels over "
-        "the MCP connection, so it still works when your sandbox has no shell networking. This is the "
-        "normal path on mobile clients.\n"
+        "the MCP connection, so it still works when your sandbox has no shell networking.\n"
         "     * If the base64 is too big to emit in ONE tool call (roughly >20 KB of base64, which is "
         "any normal photo), SLICE IT: call ark_upload_image repeatedly with the same upload_id, "
         "incrementing index, and total=N. Split the base64 STRING on a multiple-of-4 boundary and keep "
@@ -153,6 +165,8 @@ mcp = FastMCP(
         "ark_scene_profile on success returns {\"ok\": true, \"profile\": \"...\", \"images\": N}."
     ).replace(
         "<UPLOAD_COMMAND>", upload_hint(),
+    ).replace(
+        "<UPLOAD_PAGE>", upload_page_url(),
     ).replace(
         "<PUBLIC_BASE_URL>",
         ARK_PUBLIC_BASE_URL or (f"http://{ARK_HOST}:{ARK_PORT}" if ARK_HOST != "0.0.0.0"
@@ -1101,6 +1115,22 @@ def ark_job_status(job_id: str, wait_seconds: int = 0) -> dict:
 
 
 @mcp.tool()
+def ark_recent_uploads(limit: int = 5) -> dict:
+    """List the most recent images uploaded to this server, newest first.
+
+    Use this when the user says they just uploaded a photo (for example through
+    the web page at /upload) but did not paste a path. Take the first entry's
+    `path` and pass it as `image`.
+
+    Returns {"ok": true, "files": [{"path", "filename", "bytes", "uploaded_at"}]}.
+    """
+    files = _recent_uploads(limit)
+    return _ok(files=files, count=len(files),
+               hint="Use files[0].path as the `image` argument." if files
+               else "No uploads yet. Open the /upload page in a browser to add one.")
+
+
+@mcp.tool()
 def ark_show_image(image: str, max_dim: int = 1024, mode: str = "markdown"):
     """Make a generated image visible in the chat.
 
@@ -2000,7 +2030,9 @@ class _BearerAuthMiddleware:
 
     def _accepted(self, path: str) -> set:
         accepted = {t for t in (self.token,) if t}
-        if path.rstrip("/") == "/upload":
+        # The upload surface only writes/reads files in the input dir, so the
+        # narrower upload token is enough there. Everything else needs the main one.
+        if path.rstrip("/") in ("/upload", "/recent"):
             accepted.add(self.upload_token or self.token)
             accepted.discard("")
         return accepted
@@ -2042,30 +2074,12 @@ def _input_dir() -> str:
     return d
 
 
-async def _handle_upload(request):
-    """POST /upload — accept raw image bytes and park them on this machine.
-
-    Remote clients (a phone app, a browser sandbox) can see their own files but
-    this server cannot, so they push the bytes here and then pass the returned
-    absolute `path` to the editing tools.
-    """
-    from starlette.responses import JSONResponse
-
+def _save_upload_bytes(body: bytes, prefix: str = "input") -> dict:
+    """Validate image bytes, write them under the input dir. Returns a report dict."""
     limit = ARK_MAX_UPLOAD_MB * 1024 * 1024
-    declared = request.headers.get("content-length")
-    if declared and declared.isdigit() and int(declared) > limit:
-        return JSONResponse({"ok": False, "error": f"payload exceeds {ARK_MAX_UPLOAD_MB} MB"},
-                            status_code=413)
-
-    body = await request.body()
-    if not body:
-        return JSONResponse({"ok": False, "error": "empty body"}, status_code=400)
     if len(body) > limit:
-        return JSONResponse({"ok": False, "error": f"payload exceeds {ARK_MAX_UPLOAD_MB} MB"},
-                            status_code=413)
+        return {"ok": False, "error": f"payload exceeds {ARK_MAX_UPLOAD_MB} MB", "_status": 413}
 
-    # Validate it really is an image, and derive the extension from the format
-    # rather than trusting the filename.
     ext = ".jpg"
     if HAS_PIL:
         try:
@@ -2075,17 +2089,217 @@ async def _handle_upload(request):
             ext = {"JPEG": ".jpg", "PNG": ".png", "WEBP": ".webp",
                    "GIF": ".gif", "BMP": ".bmp"}.get(fmt, ".jpg")
         except Exception as e:
-            return JSONResponse({"ok": False, "error": f"not a decodable image: {e}"},
-                                status_code=400)
+            return {"ok": False, "error": f"not a decodable image: {e}", "_status": 400}
 
-    name = f"input_{uuid.uuid4().hex}{ext}"
+    name = f"{prefix}_{uuid.uuid4().hex}{ext}"
     path = os.path.join(_input_dir(), name)
-    with open(path, "wb") as fh:
-        fh.write(body)
+    try:
+        with open(path, "wb") as fh:
+            fh.write(body)
+    except OSError as e:
+        return {"ok": False, "error": f"could not write upload: {e}", "_status": 500}
 
     logger.info("Received upload: %s (%d bytes)", name, len(body))
-    return JSONResponse({"ok": True, "path": path, "bytes": len(body),
-                         "hint": "Pass this absolute path as the `image` argument."})
+    return {"ok": True, "path": path, "bytes": len(body), "filename": name}
+
+
+def _recent_uploads(limit: int = 5) -> list:
+    """Newest uploaded images on disk, newest first."""
+    try:
+        names = os.listdir(_input_dir())
+    except OSError:
+        return []
+    entries = []
+    for name in names:
+        full = os.path.join(_input_dir(), name)
+        try:
+            st = os.stat(full)
+        except OSError:
+            continue
+        if not os.path.isfile(full):
+            continue
+        entries.append({"path": full, "filename": name, "bytes": st.st_size,
+                        "uploaded_at": int(st.st_mtime)})
+    entries.sort(key=lambda e: e["uploaded_at"], reverse=True)
+    return entries[:max(1, min(int(limit or 5), 20))]
+
+
+async def _handle_upload(request):
+    """POST /upload — accept raw image bytes and park them on this machine."""
+    from starlette.responses import JSONResponse
+
+    declared = request.headers.get("content-length")
+    limit = ARK_MAX_UPLOAD_MB * 1024 * 1024
+    if declared and declared.isdigit() and int(declared) > limit:
+        return JSONResponse({"ok": False, "error": f"payload exceeds {ARK_MAX_UPLOAD_MB} MB"},
+                            status_code=413)
+
+    body = await request.body()
+    if not body:
+        return JSONResponse({"ok": False, "error": "empty body"}, status_code=400)
+
+    report = _save_upload_bytes(body)
+    status = report.pop("_status", 200)
+    if report.get("ok"):
+        report["hint"] = "Pass this absolute path as the `image` argument."
+    return JSONResponse(report, status_code=status)
+
+
+_UPLOAD_PAGE = """<!doctype html>
+<html lang="zh-CN"><head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>上传图片 · ark-image</title>
+<style>
+ :root { color-scheme: dark; }
+ * { box-sizing: border-box; }
+ body { margin:0; padding:24px 18px 60px; font:16px/1.5 -apple-system,
+        BlinkMacSystemFont,"PingFang SC","Microsoft YaHei",sans-serif;
+        background:#15171c; color:#e7e9ee; }
+ h1 { font-size:19px; margin:0 0 4px; }
+ p.sub { color:#8b93a3; font-size:13px; margin:0 0 22px; }
+ .drop { display:block; border:2px dashed #3a4150; border-radius:14px;
+         padding:34px 16px; text-align:center; color:#98a1b3; margin-bottom:16px; }
+ .drop.has { border-color:#4b8bf5; color:#c9d6ee; }
+ input[type=file] { display:none; }
+ button { width:100%; padding:15px; border:0; border-radius:12px;
+          font-size:16px; font-weight:600; background:#2f6fed; color:#fff; }
+ button:disabled { background:#2a3242; color:#69748a; }
+ .msg { margin-top:18px; padding:14px; border-radius:12px; font-size:14px;
+        white-space:pre-wrap; word-break:break-all; display:none; }
+ .msg.err { background:#3a1e22; color:#ffb4b4; display:block; }
+ .msg.ok  { background:#16301f; color:#a8e6bd; display:block; }
+ .path { margin-top:10px; padding:12px; border-radius:10px; background:#0e1116;
+         border:1px solid #2a3242; font:13px/1.45 ui-monospace,Menlo,monospace;
+         color:#9fc2ff; word-break:break-all; }
+ .copy { margin-top:8px; padding:10px; font-size:14px; background:#243044; }
+ h2 { font-size:14px; color:#8b93a3; margin:30px 0 10px; font-weight:600; }
+ .recent { list-style:none; margin:0; padding:0; }
+ .recent li { padding:11px 12px; border-radius:10px; background:#1b1f27;
+              margin-bottom:8px; font-size:13px; display:flex;
+              justify-content:space-between; gap:10px; align-items:center; }
+ .recent .name { min-width:0; flex:1 1 auto; }
+ .recent .name b { font-weight:500; display:block; overflow:hidden;
+                   text-overflow:ellipsis; white-space:nowrap; }
+ .recent span { color:#7d8698; font:12px ui-monospace,monospace; }
+ .recent button { width:auto; flex:0 0 auto; white-space:nowrap;
+                  padding:7px 12px; font-size:13px; background:#2a3242; }
+</style></head><body>
+<h1>上传图片</h1>
+<p class="sub">选一张照片传到这里，然后把它给的路径发进对话。</p>
+
+<label class="drop" id="drop">
+  <input type="file" id="file" accept="image/*">
+  <div id="pick">点击选择照片</div>
+</label>
+<button id="go" disabled>上传</button>
+
+<div class="msg" id="msg"></div>
+
+<h2>最近上传</h2>
+<ul class="recent" id="recent"><li><span>加载中…</span></li></ul>
+
+<script>
+const TOKEN = __TOKEN__;
+const fileInput = document.getElementById('file');
+const drop = document.getElementById('drop');
+const pick = document.getElementById('pick');
+const go = document.getElementById('go');
+const msg = document.getElementById('msg');
+
+fileInput.addEventListener('change', () => {
+  const f = fileInput.files[0];
+  if (!f) return;
+  pick.textContent = f.name + '  (' + (f.size/1024).toFixed(0) + ' KB)';
+  drop.classList.add('has');
+  go.disabled = false;
+});
+
+function show(html, cls) {
+  msg.innerHTML = html;
+  msg.className = 'msg ' + cls;
+  msg.scrollIntoView({behavior:'smooth', block:'nearest'});
+}
+
+go.addEventListener('click', async () => {
+  const f = fileInput.files[0];
+  if (!f) return;
+  go.disabled = true;
+  go.textContent = '上传中…';
+  try {
+    const r = await fetch('/upload?token=' + encodeURIComponent(TOKEN), {
+      method: 'POST',
+      headers: {'Authorization': 'Bearer ' + TOKEN,
+                'Content-Type': f.type || 'application/octet-stream'},
+      body: f
+    });
+    const j = await r.json();
+    if (!r.ok || !j.ok) throw new Error(j.error || ('HTTP ' + r.status));
+    show('<b>上传成功</b><div class="path">' + j.path + '</div>' +
+         '<button class="copy" onclick="copyPath(this, \\'' + j.path.replace(/\\\\/g,'\\\\\\\\') + '\\')">复制路径</button>', 'ok');
+    loadRecent();
+  } catch (e) {
+    show('上传失败：' + e.message, 'err');
+  } finally {
+    go.disabled = false;
+    go.textContent = '上传';
+  }
+});
+
+function copyPath(btn, p) {
+  const done = () => { btn.textContent = '已复制'; };
+  if (navigator.clipboard) { navigator.clipboard.writeText(p).then(done); }
+  else {
+    const t = document.createElement('textarea');
+    t.value = p; document.body.appendChild(t); t.select();
+    document.execCommand('copy'); t.remove(); done();
+  }
+}
+
+function fmtSize(n) {
+  if (n < 1024) return n + ' B';
+  if (n < 1024*1024) return (n/1024).toFixed(0) + ' KB';
+  return (n/1048576).toFixed(1) + ' MB';
+}
+
+async function loadRecent() {
+  try {
+    const r = await fetch('/recent?token=' + encodeURIComponent(TOKEN));
+    const j = await r.json();
+    const ul = document.getElementById('recent');
+    if (!j.ok || !j.files.length) { ul.innerHTML = '<li><span>还没有上传过图片</span></li>'; return; }
+    ul.innerHTML = j.files.map(f =>
+      '<li><div class="name"><b>' + f.filename + '</b><span>' + fmtSize(f.bytes) +
+      '</span></div><button onclick="copyPath(this, \\'' +
+      f.path.replace(/\\\\/g,'\\\\\\\\') + '\\')">复制</button></li>'
+    ).join('');
+  } catch (e) {}
+}
+loadRecent();
+</script>
+</body></html>
+"""
+
+
+async def _handle_upload_page(request):
+    """GET /upload — a phone-friendly page that uploads with the real browser.
+
+    The point is to keep image bytes away from the model entirely: a phone
+    sandbox may have no shell and can only emit small tool arguments, but its
+    browser can POST a 5 MB photo without any trouble.
+    """
+    from starlette.responses import HTMLResponse
+
+    token = ARK_UPLOAD_TOKEN or ARK_MCP_TOKEN
+    return HTMLResponse(_UPLOAD_PAGE.replace("__TOKEN__", json.dumps(token)))
+
+
+async def _handle_recent(request):
+    """GET /recent — recent uploads as JSON, used by the page and by clients."""
+    from starlette.responses import JSONResponse
+
+    return JSONResponse({"ok": True, "files": _recent_uploads(5)})
+
 
 
 def _build_http_app():
@@ -2101,6 +2315,8 @@ def _build_http_app():
         return mcp.sse_app()
 
     inner = mcp.streamable_http_app()
+    inner.router.routes.insert(0, Route("/recent", _handle_recent, methods=["GET"]))
+    inner.router.routes.insert(0, Route("/upload", _handle_upload_page, methods=["GET"]))
     inner.router.routes.insert(0, Route("/upload", _handle_upload, methods=["POST"]))
     return inner
 

@@ -157,15 +157,21 @@ When the server runs on a different machine than the client, a photo the user
 attached on their phone lives in the *client's* workspace and is unreadable here.
 Options, in the order the instructions tell a model to try them:
 
+0. **Browser upload page (best on phones)** — open
+   `https://your-host/upload?token=<ARK_UPLOAD_TOKEN>` in the phone's browser and
+   pick the photo. The browser posts it directly: no base64 in the conversation,
+   no shell needed, no size ceiling beyond `ARK_MAX_UPLOAD_MB`. The page shows the
+   resulting path with a copy button and lists recent uploads, and the model can
+   read them back with `ark_recent_uploads()`. This sidesteps the whole sandbox
+   problem, which is why the instructions suggest it first for large images.
+
 1. **A public http(s) URL** — if the client can hand you a download link that
    opens in a browser, pass it straight through. Nothing else needed.
 
-2. **`ark_upload_image(data=<base64>, filename=...)`** — the reliable path on
-   mobile clients. Their sandbox usually has no shell networking, so `curl`
-   cannot reach this server, but MCP tool calls do. The bytes ride the MCP
-   connection; you get back `{"ok": true, "path": "..."}`. Large photos should
-   be downscaled client-side first (~900 px longest side) — that cuts the
-   payload by roughly an order of magnitude with no loss for editing.
+2. **`ark_upload_image(data=<base64>, filename=...)`** — carries the bytes over
+   the MCP connection. Use the chunked form (`upload_id` + `index` + `total`)
+   when one call cannot hold the payload; slices are reassembled server-side and
+   may arrive out of order.
 
 3. **`POST /upload`** — for callers that *do* have shell + internet:
 
