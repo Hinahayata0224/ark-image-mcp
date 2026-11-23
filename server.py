@@ -2171,14 +2171,17 @@ _UPLOAD_PAGE = """<!doctype html>
  .msg.ok  { background:#16301f; color:#a8e6bd; display:block; }
  .path { margin-top:10px; padding:12px; border-radius:10px; background:#0e1116;
          border:1px solid #2a3242; font:13px/1.45 ui-monospace,Menlo,monospace;
-         color:#9fc2ff; word-break:break-all; }
- .copy { margin-top:8px; padding:10px; font-size:14px; background:#243044; }
+         color:#9fc2ff; word-break:break-all; cursor:pointer;
+         user-select:all; -webkit-user-select:all; }
+ .hint { margin-top:8px; font-size:12px; color:#8b93a3; }
+ .copy { margin-top:10px; padding:11px; font-size:14px; background:#243044; }
  h2 { font-size:14px; color:#8b93a3; margin:30px 0 10px; font-weight:600; }
  .recent { list-style:none; margin:0; padding:0; }
  .recent li { padding:11px 12px; border-radius:10px; background:#1b1f27;
-              margin-bottom:8px; font-size:13px; display:flex;
+              margin-bottom:8px; font-size:13px; display:flex; flex-wrap:wrap;
               justify-content:space-between; gap:10px; align-items:center; }
- .recent .name { min-width:0; flex:1 1 auto; }
+ .recent .path { flex:1 0 100%; margin-top:2px; font-size:12px; }
+ .recent .name { min-width:0; flex:1 1 0%; }
  .recent .name b { font-weight:500; display:block; overflow:hidden;
                    text-overflow:ellipsis; white-space:nowrap; }
  .recent span { color:#7d8698; font:12px ui-monospace,monospace; }
@@ -2207,10 +2210,21 @@ const pick = document.getElementById('pick');
 const go = document.getElementById('go');
 const msg = document.getElementById('msg');
 
+function esc(s) {
+  return String(s).replace(/&/g, '&amp;').replace(/</g, '&lt;')
+                  .replace(/>/g, '&gt;').replace(/"/g, '&quot;');
+}
+
+function fmtSize(n) {
+  if (n < 1024) return n + ' B';
+  if (n < 1024 * 1024) return (n / 1024).toFixed(0) + ' KB';
+  return (n / 1048576).toFixed(1) + ' MB';
+}
+
 fileInput.addEventListener('change', () => {
   const f = fileInput.files[0];
   if (!f) return;
-  pick.textContent = f.name + '  (' + (f.size/1024).toFixed(0) + ' KB)';
+  pick.textContent = f.name + '  (' + fmtSize(f.size) + ')';
   drop.classList.add('has');
   go.disabled = false;
 });
@@ -2218,8 +2232,90 @@ fileInput.addEventListener('change', () => {
 function show(html, cls) {
   msg.innerHTML = html;
   msg.className = 'msg ' + cls;
-  msg.scrollIntoView({behavior:'smooth', block:'nearest'});
+  msg.scrollIntoView({ behavior: 'smooth', block: 'nearest' });
 }
+
+// Copying on mobile needs care: navigator.clipboard rejects with
+// "Document is not focused" inside some webviews, which used to fail silently.
+// Fall back to the selection-based API, and if both fail say so instead of
+// leaving the button looking dead.
+async function copyText(text) {
+  try {
+    if (navigator.clipboard && navigator.clipboard.writeText) {
+      await navigator.clipboard.writeText(text);
+      return true;
+    }
+  } catch (e) { /* try the legacy path */ }
+  try {
+    const ta = document.createElement('textarea');
+    ta.value = text;
+    ta.setAttribute('readonly', '');
+    ta.style.position = 'fixed';
+    ta.style.top = '0';
+    ta.style.left = '0';
+    ta.style.opacity = '0';
+    document.body.appendChild(ta);
+    ta.focus();
+    ta.select();
+    ta.setSelectionRange(0, ta.value.length);
+    const ok = document.execCommand('copy');
+    ta.remove();
+    if (ok) return true;
+  } catch (e) { /* give up */ }
+  return false;
+}
+
+function selectForManualCopy(el) {
+  try {
+    const range = document.createRange();
+    range.selectNodeContents(el);
+    const sel = window.getSelection();
+    sel.removeAllRanges();
+    sel.addRange(range);
+  } catch (e) {}
+}
+
+async function copyFrom(el) {
+  const text = el.getAttribute('data-path');
+  if (!text) return;
+  const label = el.textContent;
+  const item = el.closest('li') || msg;
+  const pathEl = item.querySelector('.path');
+
+  // Immediate feedback: execCommand can block for many seconds inside some
+  // webviews, and a button that never acknowledges the tap reads as broken.
+  el.textContent = '复制中…';
+
+  const ok = await Promise.race([
+    copyText(text),
+    new Promise(r => setTimeout(() => r(false), 1500)),
+  ]);
+
+  if (ok) {
+    el.textContent = '已复制';
+  } else {
+    // Reveal the raw path and select it, so a long press offers Copy.
+    if (pathEl) {
+      pathEl.hidden = false;
+      selectForManualCopy(pathEl);
+    }
+    el.textContent = '长按路径复制';
+  }
+  setTimeout(() => { el.textContent = label; }, 3000);
+}
+
+// One delegated handler: covers items rendered later and avoids inline
+// handlers, whose string escaping previously mangled Windows paths.
+document.addEventListener('click', (ev) => {
+  const el = ev.target.closest('[data-path]');
+  if (!el) return;
+  ev.preventDefault();
+  if (el.classList.contains('path')) {
+    selectForManualCopy(el);
+    return;                       // tapping the path itself just selects it
+  }
+  copyFrom(el);
+});
 
 go.addEventListener('click', async () => {
   const f = fileInput.files[0];
@@ -2229,14 +2325,16 @@ go.addEventListener('click', async () => {
   try {
     const r = await fetch('/upload?token=' + encodeURIComponent(TOKEN), {
       method: 'POST',
-      headers: {'Authorization': 'Bearer ' + TOKEN,
-                'Content-Type': f.type || 'application/octet-stream'},
+      headers: { 'Authorization': 'Bearer ' + TOKEN,
+                 'Content-Type': f.type || 'application/octet-stream' },
       body: f
     });
     const j = await r.json();
     if (!r.ok || !j.ok) throw new Error(j.error || ('HTTP ' + r.status));
-    show('<b>上传成功</b><div class="path">' + j.path + '</div>' +
-         '<button class="copy" onclick="copyPath(this, \\'' + j.path.replace(/\\\\/g,'\\\\\\\\') + '\\')">复制路径</button>', 'ok');
+    show('<b>上传成功</b>' +
+         '<div class="path" data-path="' + esc(j.path) + '">' + esc(j.path) + '</div>' +
+         '<button class="copy" data-path="' + esc(j.path) + '">复制路径</button>' +
+         '<div class="hint">按钮没反应就长按上面的路径手动复制。</div>', 'ok');
     loadRecent();
   } catch (e) {
     show('上传失败：' + e.message, 'err');
@@ -2246,39 +2344,27 @@ go.addEventListener('click', async () => {
   }
 });
 
-function copyPath(btn, p) {
-  const done = () => { btn.textContent = '已复制'; };
-  if (navigator.clipboard) { navigator.clipboard.writeText(p).then(done); }
-  else {
-    const t = document.createElement('textarea');
-    t.value = p; document.body.appendChild(t); t.select();
-    document.execCommand('copy'); t.remove(); done();
-  }
-}
-
-function fmtSize(n) {
-  if (n < 1024) return n + ' B';
-  if (n < 1024*1024) return (n/1024).toFixed(0) + ' KB';
-  return (n/1048576).toFixed(1) + ' MB';
-}
-
 async function loadRecent() {
   try {
     const r = await fetch('/recent?token=' + encodeURIComponent(TOKEN));
     const j = await r.json();
     const ul = document.getElementById('recent');
-    if (!j.ok || !j.files.length) { ul.innerHTML = '<li><span>还没有上传过图片</span></li>'; return; }
+    if (!j.ok || !j.files.length) {
+      ul.innerHTML = '<li><span>还没有上传过图片</span></li>';
+      return;
+    }
     ul.innerHTML = j.files.map(f =>
-      '<li><div class="name"><b>' + f.filename + '</b><span>' + fmtSize(f.bytes) +
-      '</span></div><button onclick="copyPath(this, \\'' +
-      f.path.replace(/\\\\/g,'\\\\\\\\') + '\\')">复制</button></li>'
+      '<li><div class="name"><b>' + esc(f.filename) + '</b><span>' +
+      fmtSize(f.bytes) + '</span></div>' +
+      '<button data-path="' + esc(f.path) + '">复制</button>' +
+      '<div class="path" hidden data-path="' + esc(f.path) + '">' +
+      esc(f.path) + '</div></li>'
     ).join('');
   } catch (e) {}
 }
 loadRecent();
 </script>
-</body></html>
-"""
+</body></html>"""
 
 
 async def _handle_upload_page(request):
